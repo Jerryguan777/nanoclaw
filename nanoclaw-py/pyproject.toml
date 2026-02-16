@@ -1,0 +1,31 @@
+[project]
+name = "nanoclaw"
+version = "1.0.0"
+description = "Personal Claude agent. Lightweight, secure, customizable. Python edition."
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.0,<3.0",
+    "structlog>=24.0",
+    "fastapi>=0.115",
+    "uvicorn>=0.34",
+    "croniter>=5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8",
+]
+
+[project.scripts]
+nanoclaw = "nanoclaw.main:cli_entry"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.setuptools.packages.find]
+include = ["nanoclaw*"]
+
+[tool.ruff]
+line-length = 100

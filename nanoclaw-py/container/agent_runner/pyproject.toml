@@ -1,0 +1,11 @@
+[project]
+name = "nanoclaw-agent-runner"
+version = "1.0.0"
+description = "Container-side agent runner for NanoClaw (Python)"
+requires-python = ">=3.12"
+dependencies = [
+    "claude-code-sdk>=0.1",
+    "mcp>=1.0",
+    "croniter>=5.0",
+    "pydantic>=2.0",
+]
