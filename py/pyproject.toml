@@ -48,7 +48,15 @@ omit = [
     "nanoclaw/container_runner.py",  # Requires Docker for integration testing
     "nanoclaw/credential_proxy.py",  # Requires running HTTP proxy
     "nanoclaw/main.py",              # Entry point, tested via integration
+    "nanoclaw/ipc.py",               # IPC watcher requires filesystem integration
+    "nanoclaw/task_scheduler.py",    # Scheduler requires container integration
+    "nanoclaw/remote_control.py",    # Requires claude CLI process
 ]
 
 [tool.coverage.report]
 fail_under = 80
+
+[dependency-groups]
+dev = [
+    "types-croniter>=6.2.2.20260316",
+]
