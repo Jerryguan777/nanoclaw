@@ -44,6 +44,11 @@ show_error_codes = true
 
 [tool.coverage.run]
 source = ["nanoclaw"]
+omit = [
+    "nanoclaw/container_runner.py",  # Requires Docker for integration testing
+    "nanoclaw/credential_proxy.py",  # Requires running HTTP proxy
+    "nanoclaw/main.py",              # Entry point, tested via integration
+]
 
 [tool.coverage.report]
 fail_under = 80
