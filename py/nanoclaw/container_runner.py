@@ -231,7 +231,7 @@ def build_volume_mounts(
     mounts.append(
         VolumeMount(
             host_path=str(group_sessions_dir),
-            container_path="/home/node/.claude",
+            container_path="/home/agent/.claude",
             readonly=False,
         )
     )
@@ -250,20 +250,9 @@ def build_volume_mounts(
         )
     )
 
-    # Copy agent-runner source into a per-group writable location so agents
-    # can customize it (add tools, change behavior) without affecting other
-    # groups. Recompiled on container startup via entrypoint.sh.
-    agent_runner_src = project_root / "container" / "agent-runner" / "src"
-    group_agent_runner_dir = DATA_DIR / "sessions" / group.folder / "agent-runner-src"
-    if not group_agent_runner_dir.exists() and agent_runner_src.exists():
-        shutil.copytree(str(agent_runner_src), str(group_agent_runner_dir))
-    mounts.append(
-        VolumeMount(
-            host_path=str(group_agent_runner_dir),
-            container_path="/app/src",
-            readonly=False,
-        )
-    )
+    # Python agent-runner is baked into the container image (no per-group source mount needed).
+    # TS version mounted source for per-group customization + runtime compilation;
+    # Python runs directly from /app/agent_runner/ in the image.
 
     # Additional mounts validated against external allowlist (tamper-proof from containers)
     if group.container_config and group.container_config.additional_mounts:
@@ -329,7 +318,7 @@ def build_container_args(
         host_gid = os.getgid()
     if host_uid is not None and host_uid != 0 and host_uid != 1000:
         args.extend(["--user", f"{host_uid}:{host_gid}"])
-        args.extend(["-e", "HOME=/home/node"])
+        args.extend(["-e", "HOME=/home/agent"])
 
     for mount in mounts:
         if mount.readonly:
