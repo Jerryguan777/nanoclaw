@@ -480,10 +480,7 @@ async def run_query(
                 if session_id_from_result:
                     result.new_session_id = session_id_from_result
                 preview = text_result[:200] if text_result else ""
-                log(
-                    f"Result #{result_count}: subtype={subtype}"
-                    f"{f' text={preview}' if text_result else ''}"
-                )
+                log(f"Result #{result_count}: subtype={subtype}{f' text={preview}' if text_result else ''}")
                 write_output(
                     ContainerOutput(
                         status="success",
