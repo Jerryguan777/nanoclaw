@@ -88,17 +88,35 @@ async def start_credential_proxy(port: int, host: str = "127.0.0.1") -> web.AppR
                 data=body,
                 allow_redirects=False,
             ) as upstream_resp:
+                # Filter out hop-by-hop and encoding headers.
+                # aiohttp auto-decompresses gzip, so we must strip content-encoding
+                # to avoid the client trying to decompress already-decoded data (ZlibError).
+                _skip_headers = frozenset(
+                    {
+                        "content-encoding",
+                        "transfer-encoding",
+                        "content-length",
+                        "connection",
+                        "keep-alive",
+                    }
+                )
+                resp_headers = {k: v for k, v in upstream_resp.headers.items() if k.lower() not in _skip_headers}
+
                 response = web.StreamResponse(
                     status=upstream_resp.status,
-                    headers=upstream_resp.headers,
+                    headers=resp_headers,
                 )
                 await response.prepare(request)
                 async for chunk in upstream_resp.content.iter_any():
                     await response.write(chunk)
                 await response.write_eof()
                 return response
-        except Exception:
-            logger.exception("Credential proxy upstream error", url=str(request.url))
+        except ConnectionResetError:
+            # Container disconnected mid-stream (normal during shutdown/timeout)
+            logger.debug("Credential proxy: client disconnected", url=str(request.url))
+            return web.Response(status=499, text="Client Disconnected")
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.error("Credential proxy upstream error", url=str(request.url), error=str(exc))
             return web.Response(status=502, text="Bad Gateway")
 
     app = web.Application()
