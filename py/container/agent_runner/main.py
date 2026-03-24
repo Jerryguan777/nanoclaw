@@ -17,6 +17,7 @@ Stdout protocol:
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import sys
@@ -25,7 +26,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import anyio
 from claude_agent_sdk import ClaudeAgentOptions, HookMatcher, query
 
 from .ipc_mcp import create_nanoclaw_mcp_server
@@ -104,7 +104,7 @@ class MessageStream:
 
     def __init__(self) -> None:
         self._queue: list[dict[str, Any]] = []
-        self._event: anyio.Event = anyio.Event()
+        self._event: asyncio.Event = asyncio.Event()
         self._done: bool = False
 
     def push(self, text: str) -> None:
@@ -128,7 +128,7 @@ class MessageStream:
                 yield self._queue.pop(0)
             if self._done:
                 return
-            self._event = anyio.Event()
+            self._event.clear()
             await self._event.wait()
 
 
@@ -324,7 +324,7 @@ async def wait_for_ipc_message() -> str | None:
         messages = drain_ipc_input()
         if messages:
             return "\n".join(messages)
-        await anyio.sleep(IPC_POLL_SECONDS)
+        await asyncio.sleep(IPC_POLL_SECONDS)
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +366,7 @@ async def run_query(
             for text in messages:
                 log(f"Piping IPC message into active query ({len(text)} chars)")
                 stream.push(text)
-            await anyio.sleep(IPC_POLL_SECONDS)
+            await asyncio.sleep(IPC_POLL_SECONDS)
 
     # Load global CLAUDE.md as additional system context (shared across all groups)
     global_claude_md_path = Path("/workspace/global/CLAUDE.md")
@@ -439,35 +439,49 @@ async def run_query(
     message_count = 0
     result_count = 0
 
-    async with anyio.create_task_group() as tg:
-        tg.start_soon(poll_ipc_during_query)
+    # Start IPC polling as a background task (not in the same task group as query)
+    poll_task = asyncio.ensure_future(poll_ipc_during_query())
 
+    try:
         async for message in query(prompt=stream, options=options):
             message_count += 1
-            msg_type = message.get("type", "")
-            if msg_type == "system":
-                msg_type = f"system/{message.get('subtype', '')}"
-            log(f"[msg #{message_count}] type={msg_type}")
 
-            if message.get("type") == "assistant" and "uuid" in message:
-                result.last_assistant_uuid = message["uuid"]
+            # Determine message type from the object class name
+            cls_name = type(message).__name__
+            log_type = cls_name
 
-            if message.get("type") == "system" and message.get("subtype") == "init":
-                result.new_session_id = message.get("session_id")
-                log(f"Session initialized: {result.new_session_id}")
+            if cls_name == "SystemMessage":
+                subtype = getattr(message, "subtype", "")
+                log_type = f"system/{subtype}"
+                data = getattr(message, "data", {})
 
-            if message.get("type") == "system" and message.get("subtype") == "task_notification":
-                log(
-                    f"Task notification: task={message.get('task_id')} "
-                    f"status={message.get('status')} summary={message.get('summary')}"
-                )
+                if subtype == "init":
+                    result.new_session_id = data.get("session_id") if isinstance(data, dict) else None
+                    log(f"Session initialized: {result.new_session_id}")
 
-            if message.get("type") == "result":
+                elif subtype == "task_notification":
+                    log(
+                        f"Task notification: task={data.get('task_id')} "
+                        f"status={data.get('status')} summary={data.get('summary')}"
+                        if isinstance(data, dict)
+                        else f"Task notification: {data}"
+                    )
+
+            elif cls_name == "AssistantMessage":
+                uuid = getattr(message, "uuid", None)
+                if uuid:
+                    result.last_assistant_uuid = uuid
+
+            elif cls_name == "ResultMessage":
                 result_count += 1
-                text_result = message.get("result")
+                text_result = getattr(message, "result", None)
+                subtype = getattr(message, "subtype", "")
+                session_id_from_result = getattr(message, "session_id", None)
+                if session_id_from_result:
+                    result.new_session_id = session_id_from_result
                 preview = text_result[:200] if text_result else ""
                 log(
-                    f"Result #{result_count}: subtype={message.get('subtype')}"
+                    f"Result #{result_count}: subtype={subtype}"
                     f"{f' text={preview}' if text_result else ''}"
                 )
                 write_output(
@@ -478,9 +492,13 @@ async def run_query(
                     )
                 )
 
+            log(f"[msg #{message_count}] type={log_type}")
+    finally:
         # Stop IPC polling once the query iterator ends
         ipc_polling = False
-        tg.cancel_scope.cancel()
+        poll_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await poll_task
 
     log(
         f"Query done. Messages: {message_count}, results: {result_count}, "

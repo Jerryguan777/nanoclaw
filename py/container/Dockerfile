@@ -32,6 +32,9 @@ RUN chown -R agent:agent /workspace && chmod 777 /home/agent
 # Switch to non-root user
 USER agent
 
+# Ensure agent_runner is importable from any working directory
+ENV PYTHONPATH=/app
+
 # Set working directory to group workspace
 WORKDIR /workspace/group
 

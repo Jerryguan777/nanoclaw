@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import anyio
+import asyncio
 
 from .main import main
 
-anyio.run(main)
+asyncio.run(main())
