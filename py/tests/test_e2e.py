@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 from unittest.mock import patch
@@ -75,12 +76,16 @@ def e2e_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr("nanoclaw.config.SCHEDULER_POLL_INTERVAL", 0.05)
     monkeypatch.setattr("nanoclaw.config.IDLE_TIMEOUT", 1000)
     monkeypatch.setattr("nanoclaw.config.TIMEZONE", "UTC")
+    monkeypatch.setattr("nanoclaw.config.ASSISTANT_NAME", "Andy")
+    monkeypatch.setattr("nanoclaw.config.TRIGGER_PATTERN", re.compile(r"^@Andy\b", re.IGNORECASE))
 
     # Also patch in modules that import these at module-load time
     monkeypatch.setattr("nanoclaw.group_folder.DATA_DIR", data_dir)
     monkeypatch.setattr("nanoclaw.group_folder.GROUPS_DIR", groups_dir)
     monkeypatch.setattr("nanoclaw.group_queue.DATA_DIR", data_dir)
     monkeypatch.setattr("nanoclaw.main.TIMEZONE", "UTC")
+    monkeypatch.setattr("nanoclaw.main.ASSISTANT_NAME", "Andy")
+    monkeypatch.setattr("nanoclaw.main.TRIGGER_PATTERN", re.compile(r"^@Andy\b", re.IGNORECASE))
 
     from nanoclaw.db import _init_test_database
 

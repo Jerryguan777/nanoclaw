@@ -19,16 +19,26 @@ def test_slack_registered() -> None:
     assert factory is not None
 
 
-def test_telegram_factory_returns_none_without_token() -> None:
+def test_telegram_factory_returns_none_without_token(monkeypatch: object) -> None:
     """Telegram factory returns None when TELEGRAM_BOT_TOKEN is not set."""
+    import pytest
+
+    mp = pytest.MonkeyPatch()
+    mp.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+
     factory = get_channel_factory("telegram")
     assert factory is not None
-    # Without token in env or .env, should return None
-    from unittest.mock import MagicMock
+    from unittest.mock import MagicMock, patch
 
     opts = MagicMock()
-    result = factory(opts)
+    # Mock read_env_file to return empty (no .env token)
+    with (
+        patch("nanoclaw.channels.telegram.read_env_file", return_value={}),
+        patch("nanoclaw.channels.telegram.os.environ.get", return_value=None),
+    ):
+        result = factory(opts)
     assert result is None
+    mp.undo()
 
 
 def test_slack_factory_returns_none_without_tokens() -> None:

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import re
-import time
 from pathlib import Path
 
 from nanoclaw.env import read_env_file
@@ -41,22 +40,27 @@ TRIGGER_PATTERN: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
-# Timezone for scheduled tasks — uses system timezone by default
-TIMEZONE: str = os.environ.get("TZ") or time.tzname[0]
+# Timezone for scheduled tasks — needs IANA name (e.g. "America/New_York"), not abbreviation ("EST").
+TIMEZONE: str = os.environ.get("TZ", "")
 
-# Try to get IANA timezone name
-try:
-    import zoneinfo  # noqa: F401 — only to validate
+if not TIMEZONE or "/" not in TIMEZONE:
+    # Try /etc/timezone (Debian/Ubuntu)
+    try:
+        _tz = Path("/etc/timezone").read_text().strip()
+        if "/" in _tz:
+            TIMEZONE = _tz
+    except OSError:
+        pass
 
-    _local_tz = time.tzname[0]
-    # time.tzname gives abbreviations like "EST"; we need IANA names
-    # Use the datetime approach to get the proper IANA name
-    from datetime import datetime as _dt
+if not TIMEZONE or "/" not in TIMEZONE:
+    # Try /etc/localtime symlink (most Linux distros + macOS)
+    try:
+        _link = os.readlink("/etc/localtime")
+        _tz = _link.split("zoneinfo/")[-1]
+        if "/" in _tz:
+            TIMEZONE = _tz
+    except OSError:
+        pass
 
-    _tz_name = _dt.now().astimezone().tzinfo
-    if _tz_name is not None:
-        _name = str(_tz_name)
-        if "/" in _name:
-            TIMEZONE = _name
-except Exception:  # noqa: BLE001
-    pass
+if not TIMEZONE or "/" not in TIMEZONE:
+    TIMEZONE = "UTC"
