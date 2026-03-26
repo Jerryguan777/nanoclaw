@@ -19,7 +19,7 @@ RUN pip install --no-cache-dir claude-agent-sdk croniter
 WORKDIR /app
 
 # Copy agent runner code
-COPY agent_runner/ ./agent_runner/
+COPY src/agent_runner/ ./agent_runner/
 
 # Create workspace directories
 RUN mkdir -p /workspace/group /workspace/global /workspace/extra \

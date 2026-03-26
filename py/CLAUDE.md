@@ -12,7 +12,8 @@ This directory contains the Python rewrite of NanoClaw (originally TypeScript).
 - **structlog** for logging
 - **pathlib.Path** for all file path operations
 - Code comments and docstrings in **English only**
-- Run `ruff check . && ruff format --check . && mypy --strict . && pytest --cov-fail-under=80` before committing
+- **src layout** — all packages live under `src/`, install with `uv pip install -e ".[dev]"` for development
+- Run `ruff check . && ruff format --check . && mypy --strict src/nanoclaw && pytest --cov --cov-fail-under=80` before committing
 
 ## Architecture
 

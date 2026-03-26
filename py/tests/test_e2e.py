@@ -68,26 +68,26 @@ def e2e_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     groups_dir.mkdir()
     store_dir.mkdir()
 
-    monkeypatch.setattr("nanoclaw.config.DATA_DIR", data_dir)
-    monkeypatch.setattr("nanoclaw.config.GROUPS_DIR", groups_dir)
-    monkeypatch.setattr("nanoclaw.config.STORE_DIR", store_dir)
-    monkeypatch.setattr("nanoclaw.config.POLL_INTERVAL", 0.05)
-    monkeypatch.setattr("nanoclaw.config.IPC_POLL_INTERVAL", 0.05)
-    monkeypatch.setattr("nanoclaw.config.SCHEDULER_POLL_INTERVAL", 0.05)
-    monkeypatch.setattr("nanoclaw.config.IDLE_TIMEOUT", 1000)
-    monkeypatch.setattr("nanoclaw.config.TIMEZONE", "UTC")
-    monkeypatch.setattr("nanoclaw.config.ASSISTANT_NAME", "Andy")
-    monkeypatch.setattr("nanoclaw.config.TRIGGER_PATTERN", re.compile(r"^@Andy\b", re.IGNORECASE))
+    monkeypatch.setattr("nanoclaw.core.config.DATA_DIR", data_dir)
+    monkeypatch.setattr("nanoclaw.core.config.GROUPS_DIR", groups_dir)
+    monkeypatch.setattr("nanoclaw.core.config.STORE_DIR", store_dir)
+    monkeypatch.setattr("nanoclaw.core.config.POLL_INTERVAL", 0.05)
+    monkeypatch.setattr("nanoclaw.core.config.IPC_POLL_INTERVAL", 0.05)
+    monkeypatch.setattr("nanoclaw.core.config.SCHEDULER_POLL_INTERVAL", 0.05)
+    monkeypatch.setattr("nanoclaw.core.config.IDLE_TIMEOUT", 1000)
+    monkeypatch.setattr("nanoclaw.core.config.TIMEZONE", "UTC")
+    monkeypatch.setattr("nanoclaw.core.config.ASSISTANT_NAME", "Andy")
+    monkeypatch.setattr("nanoclaw.core.config.TRIGGER_PATTERN", re.compile(r"^@Andy\b", re.IGNORECASE))
 
     # Also patch in modules that import these at module-load time
-    monkeypatch.setattr("nanoclaw.group_folder.DATA_DIR", data_dir)
-    monkeypatch.setattr("nanoclaw.group_folder.GROUPS_DIR", groups_dir)
-    monkeypatch.setattr("nanoclaw.group_queue.DATA_DIR", data_dir)
+    monkeypatch.setattr("nanoclaw.core.group_folder.DATA_DIR", data_dir)
+    monkeypatch.setattr("nanoclaw.core.group_folder.GROUPS_DIR", groups_dir)
+    monkeypatch.setattr("nanoclaw.container.scheduler.DATA_DIR", data_dir)
     monkeypatch.setattr("nanoclaw.main.TIMEZONE", "UTC")
     monkeypatch.setattr("nanoclaw.main.ASSISTANT_NAME", "Andy")
     monkeypatch.setattr("nanoclaw.main.TRIGGER_PATTERN", re.compile(r"^@Andy\b", re.IGNORECASE))
 
-    from nanoclaw.db import _init_test_database
+    from nanoclaw.db.sqlite import _init_test_database
 
     _init_test_database()
 
@@ -106,7 +106,7 @@ def make_container_mock(
     error: str | None = None,
 ) -> Callable[..., Awaitable[object]]:
     """Create a mock for run_container_agent that simulates container execution."""
-    from nanoclaw.container_runner import ContainerOutput
+    from nanoclaw.container.runner import ContainerOutput
 
     captured_inputs: list[object] = []
 
@@ -149,8 +149,8 @@ def setup_main_state(
 ) -> None:
     """Wire up main.py module-level state for testing."""
     import nanoclaw.main as m
-    from nanoclaw.db import set_registered_group, store_chat_metadata
-    from nanoclaw.types import RegisteredGroup
+    from nanoclaw.core.types import RegisteredGroup
+    from nanoclaw.db.sqlite import set_registered_group, store_chat_metadata
 
     group = RegisteredGroup(
         name="Test Group",
@@ -188,8 +188,8 @@ def inject_message(
     timestamp: str = "2024-06-01T12:00:01Z",
 ) -> None:
     """Store a message directly in the DB as if a channel delivered it."""
-    from nanoclaw.db import store_message
-    from nanoclaw.types import NewMessage
+    from nanoclaw.core.types import NewMessage
+    from nanoclaw.db.sqlite import store_message
 
     store_message(
         NewMessage(
@@ -288,7 +288,7 @@ async def test_session_persistence(e2e_env: Path) -> None:
     # Session should be persisted
     assert m._sessions.get("testgroup") == "sess-abc-123"
 
-    from nanoclaw.db import get_session
+    from nanoclaw.db.sqlite import get_session
 
     assert get_session("testgroup") == "sess-abc-123"
 
@@ -364,7 +364,7 @@ async def test_format_messages_xml(e2e_env: Path) -> None:
 
     captured_prompts: list[str] = []
 
-    from nanoclaw.container_runner import ContainerInput, ContainerOutput
+    from nanoclaw.container.runner import ContainerInput, ContainerOutput
 
     async def capturing_mock(
         group: object,
@@ -393,9 +393,9 @@ async def test_format_messages_xml(e2e_env: Path) -> None:
 
 async def test_sender_allowlist_drop_mode(e2e_env: Path) -> None:
     """Drop mode: messages from non-allowed senders are not stored."""
-    from nanoclaw.db import get_messages_since
-    from nanoclaw.sender_allowlist import ChatAllowlistEntry, SenderAllowlistConfig
-    from nanoclaw.types import NewMessage
+    from nanoclaw.core.types import NewMessage
+    from nanoclaw.db.sqlite import get_messages_since
+    from nanoclaw.security.sender_allowlist import ChatAllowlistEntry, SenderAllowlistConfig
 
     channel = MockChannel(owned_jids=["chat@test"])
     setup_main_state(channel)
@@ -420,14 +420,14 @@ async def test_sender_allowlist_drop_mode(e2e_env: Path) -> None:
 
         # Simulate the on_message handler from main.py
         if not msg.is_from_me and not msg.is_bot_message and msg.chat_jid in m._registered_groups:
-            from nanoclaw.sender_allowlist import is_sender_allowed, should_drop_message
+            from nanoclaw.security.sender_allowlist import is_sender_allowed, should_drop_message
 
             if should_drop_message(msg.chat_jid, drop_config) and not is_sender_allowed(
                 msg.chat_jid, msg.sender, drop_config
             ):
                 pass  # Message dropped
             else:
-                from nanoclaw.db import store_message
+                from nanoclaw.db.sqlite import store_message
 
                 store_message(msg)
 
@@ -438,9 +438,9 @@ async def test_sender_allowlist_drop_mode(e2e_env: Path) -> None:
 
 async def test_ipc_task_scheduling(e2e_env: Path) -> None:
     """IPC task file → creates scheduled task in DB."""
-    from nanoclaw.db import get_task_by_id
-    from nanoclaw.ipc import process_task_ipc
-    from nanoclaw.types import RegisteredGroup
+    from nanoclaw.core.types import RegisteredGroup
+    from nanoclaw.db.sqlite import get_task_by_id
+    from nanoclaw.ipc.file_transport import process_task_ipc
 
     registered = {
         "chat@test": RegisteredGroup(
@@ -506,7 +506,7 @@ async def test_ipc_message_routing(e2e_env: Path) -> None:
     ipc_dir = data_dir / "ipc" / "testgroup" / "messages"
     ipc_dir.mkdir(parents=True)
 
-    from nanoclaw.types import RegisteredGroup
+    from nanoclaw.core.types import RegisteredGroup
 
     registered = {
         "chat@test": RegisteredGroup(
@@ -546,7 +546,7 @@ async def test_ipc_message_routing(e2e_env: Path) -> None:
     msg_file = ipc_dir / "001.json"
     msg_file.write_text(json.dumps({"type": "message", "chatJid": "chat@test", "text": "Hello from IPC!"}))
 
-    from nanoclaw.ipc import _process_ipc_files
+    from nanoclaw.ipc.file_transport import _process_ipc_files
 
     deps = FakeDeps()
     ipc_base = data_dir / "ipc"
@@ -559,7 +559,7 @@ async def test_ipc_message_routing(e2e_env: Path) -> None:
 
 async def test_queue_concurrency(e2e_env: Path) -> None:
     """Multiple groups enqueue → respects concurrency limit."""
-    from nanoclaw.group_queue import GroupQueue
+    from nanoclaw.container.scheduler import GroupQueue
 
     queue = GroupQueue()
     processing_order: list[str] = []
@@ -592,8 +592,8 @@ async def test_queue_concurrency(e2e_env: Path) -> None:
 
 async def test_scheduled_task_compute_next_run(e2e_env: Path) -> None:
     """compute_next_run correctly calculates next execution time."""
-    from nanoclaw.task_scheduler import compute_next_run
-    from nanoclaw.types import ScheduledTask
+    from nanoclaw.core.types import ScheduledTask
+    from nanoclaw.orchestration.task_scheduler import compute_next_run
 
     # once → None
     task_once = ScheduledTask(

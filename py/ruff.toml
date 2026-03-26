@@ -20,7 +20,7 @@ ignore = [
 ]
 
 [lint.isort]
-known-first-party = ["nanoclaw"]
+known-first-party = ["nanoclaw", "agent_runner"]
 
 [format]
 quote-style = "double"
