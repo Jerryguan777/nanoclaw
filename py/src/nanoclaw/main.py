@@ -183,7 +183,8 @@ async def _start_nats_ipc_subscriptions(transport: NatsTransport, deps: _IpcDeps
     tasks: list[asyncio.Task[None]] = []
 
     # Subscribe to agent messages (Channel 4: agent -> user)
-    messages_sub = await transport.js.subscribe("agent.*.messages")
+    # Durable consumer so NATS remembers our position across restarts.
+    messages_sub = await transport.js.subscribe("agent.*.messages", durable="orch-messages")
 
     async def _handle_messages() -> None:
         async for msg in messages_sub.messages:
@@ -220,7 +221,7 @@ async def _start_nats_ipc_subscriptions(transport: NatsTransport, deps: _IpcDeps
     tasks.append(asyncio.create_task(_handle_messages()))
 
     # Subscribe to agent tasks (Channel 5: agent -> orch)
-    tasks_sub = await transport.js.subscribe("agent.*.tasks")
+    tasks_sub = await transport.js.subscribe("agent.*.tasks", durable="orch-tasks")
 
     async def _handle_tasks() -> None:
         async for msg in tasks_sub.messages:
