@@ -7,7 +7,6 @@ Uses in-memory SQLite, real GroupQueue, real message routing.
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -72,7 +71,6 @@ def e2e_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr("nanoclaw.core.config.GROUPS_DIR", groups_dir)
     monkeypatch.setattr("nanoclaw.core.config.STORE_DIR", store_dir)
     monkeypatch.setattr("nanoclaw.core.config.POLL_INTERVAL", 0.05)
-    monkeypatch.setattr("nanoclaw.core.config.IPC_POLL_INTERVAL", 0.05)
     monkeypatch.setattr("nanoclaw.core.config.SCHEDULER_POLL_INTERVAL", 0.05)
     monkeypatch.setattr("nanoclaw.core.config.IDLE_TIMEOUT", 1000)
     monkeypatch.setattr("nanoclaw.core.config.TIMEZONE", "UTC")
@@ -82,7 +80,6 @@ def e2e_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     # Also patch in modules that import these at module-load time
     monkeypatch.setattr("nanoclaw.core.group_folder.DATA_DIR", data_dir)
     monkeypatch.setattr("nanoclaw.core.group_folder.GROUPS_DIR", groups_dir)
-    monkeypatch.setattr("nanoclaw.container.scheduler.DATA_DIR", data_dir)
     monkeypatch.setattr("nanoclaw.main.TIMEZONE", "UTC")
     monkeypatch.setattr("nanoclaw.main.ASSISTANT_NAME", "Andy")
     monkeypatch.setattr("nanoclaw.main.TRIGGER_PATTERN", re.compile(r"^@Andy\b", re.IGNORECASE))
@@ -115,9 +112,10 @@ def make_container_mock(
         inp: object,
         on_process: Callable[..., None],
         on_output: Callable[..., Awaitable[None]] | None = None,
+        transport: object | None = None,
     ) -> ContainerOutput:
         captured_inputs.append(inp)
-        on_process(object(), "test-container-mock")
+        on_process(object(), "test-container-mock", "test-job")
 
         output = ContainerOutput(
             status=status,  # type: ignore[arg-type]
@@ -371,9 +369,10 @@ async def test_format_messages_xml(e2e_env: Path) -> None:
         inp: ContainerInput,
         on_process: Callable[..., None],
         on_output: Callable[..., Awaitable[None]] | None = None,
+        transport: object | None = None,
     ) -> ContainerOutput:
         captured_prompts.append(inp.prompt)
-        on_process(object(), "test-container")
+        on_process(object(), "test-container", "test-job")
         if on_output:
             await on_output(ContainerOutput(status="success", result="OK"))
         return ContainerOutput(status="success", result=None)
@@ -440,7 +439,7 @@ async def test_ipc_task_scheduling(e2e_env: Path) -> None:
     """IPC task file → creates scheduled task in DB."""
     from nanoclaw.core.types import RegisteredGroup
     from nanoclaw.db.sqlite import get_task_by_id
-    from nanoclaw.ipc.file_transport import process_task_ipc
+    from nanoclaw.ipc.task_handler import process_task_ipc
 
     registered = {
         "chat@test": RegisteredGroup(
@@ -500,13 +499,10 @@ async def test_ipc_task_scheduling(e2e_env: Path) -> None:
     assert len(tasks_changed) == 1
 
 
-async def test_ipc_message_routing(e2e_env: Path) -> None:
-    """IPC message file in group dir → routed to channel.send_message."""
-    data_dir = e2e_env / "data"
-    ipc_dir = data_dir / "ipc" / "testgroup" / "messages"
-    ipc_dir.mkdir(parents=True)
-
+async def test_ipc_task_handler_message_auth(e2e_env: Path) -> None:
+    """IPC task handler processes messages with proper authorization."""
     from nanoclaw.core.types import RegisteredGroup
+    from nanoclaw.ipc.task_handler import process_task_ipc
 
     registered = {
         "chat@test": RegisteredGroup(
@@ -517,12 +513,11 @@ async def test_ipc_message_routing(e2e_env: Path) -> None:
             is_main=True,
         )
     }
-
-    sent_messages: list[tuple[str, str]] = []
+    tasks_changed: list[bool] = []
 
     class FakeDeps:
         async def send_message(self, jid: str, text: str) -> None:
-            sent_messages.append((jid, text))
+            pass
 
         def registered_groups(self) -> dict[str, RegisteredGroup]:
             return registered
@@ -540,21 +535,24 @@ async def test_ipc_message_routing(e2e_env: Path) -> None:
             pass
 
         def on_tasks_changed(self) -> None:
-            pass
-
-    # Write an IPC message file
-    msg_file = ipc_dir / "001.json"
-    msg_file.write_text(json.dumps({"type": "message", "chatJid": "chat@test", "text": "Hello from IPC!"}))
-
-    from nanoclaw.ipc.file_transport import _process_ipc_files
+            tasks_changed.append(True)
 
     deps = FakeDeps()
-    ipc_base = data_dir / "ipc"
-    await _process_ipc_files(ipc_base, deps)  # type: ignore[arg-type]
 
-    assert len(sent_messages) == 1
-    assert sent_messages[0] == ("chat@test", "Hello from IPC!")
-    assert not msg_file.exists()  # File consumed
+    # Non-main trying to schedule for another group should be blocked
+    await process_task_ipc(
+        {
+            "type": "schedule_task",
+            "prompt": "Should be blocked",
+            "schedule_type": "cron",
+            "schedule_value": "0 9 * * *",
+            "targetJid": "chat@test",
+        },
+        "other-group",
+        False,  # not main
+        deps,  # type: ignore[arg-type]
+    )
+    assert len(tasks_changed) == 0  # Blocked
 
 
 async def test_queue_concurrency(e2e_env: Path) -> None:

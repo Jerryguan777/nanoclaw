@@ -12,11 +12,14 @@ import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from nanoclaw.core.config import DATA_DIR, MAX_CONCURRENT_CONTAINERS
 from nanoclaw.core.logger import get_logger
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
+
+    from nanoclaw.ipc.nats_transport import NatsTransport
+
+from nanoclaw.core.config import MAX_CONCURRENT_CONTAINERS
 
 logger = get_logger()
 
@@ -42,19 +45,21 @@ class _GroupState:
     process: object | None = None  # asyncio.subprocess.Process
     container_name: str | None = None
     group_folder: str | None = None
+    job_id: str | None = None
     retry_count: int = 0
 
 
 class GroupQueue:
     """Manages per-group container concurrency and task/message queuing."""
 
-    def __init__(self) -> None:
+    def __init__(self, transport: NatsTransport | None = None) -> None:
         self._groups: dict[str, _GroupState] = {}
         self._active_count: int = 0
         self._waiting_groups: list[str] = []
         self._process_messages_fn: Callable[[str], Awaitable[bool]] | None = None
         self._shutting_down: bool = False
         self._background_tasks: set[asyncio.Task[None]] = set()
+        self._transport = transport
 
     def _spawn(self, coro: Awaitable[None]) -> None:
         """Launch a background task and track it to prevent GC."""
@@ -142,6 +147,7 @@ class GroupQueue:
         proc: object,
         container_name: str,
         group_folder: str | None = None,
+        job_id: str | None = None,
     ) -> None:
         """Track an active container process for a group."""
         state = self._get_group(group_jid)
@@ -149,6 +155,8 @@ class GroupQueue:
         state.container_name = container_name
         if group_folder:
             state.group_folder = group_folder
+        if job_id:
+            state.job_id = job_id
 
     def notify_idle(self, group_jid: str) -> None:
         """Mark container as idle-waiting. Preempt if tasks pending."""
@@ -158,38 +166,57 @@ class GroupQueue:
             self.close_stdin(group_jid)
 
     def send_message(self, group_jid: str, text: str) -> bool:
-        """Send a follow-up message to the active container via IPC file."""
+        """Send a follow-up message to the active container via NATS JetStream."""
         state = self._get_group(group_jid)
-        if not state.active or not state.group_folder or state.is_task_container:
+        if not state.active or not state.job_id or state.is_task_container:
             return False
         state.idle_waiting = False
 
-        input_dir = DATA_DIR / "ipc" / state.group_folder / "input"
-        try:
-            input_dir.mkdir(parents=True, exist_ok=True)
-            import time
+        if self._transport is None:
+            return False
 
-            filename = f"{int(time.time() * 1000)}-{id(text) % 10000:04d}.json"
-            filepath = input_dir / filename
-            temp_path = filepath.with_suffix(".json.tmp")
-            temp_path.write_text(json.dumps({"type": "message", "text": text}))
-            temp_path.rename(filepath)
+        try:
+
+            async def _send() -> None:
+                assert self._transport is not None
+                assert state.job_id is not None
+                await self._transport.js.publish(
+                    f"agent.{state.job_id}.input",
+                    json.dumps({"type": "message", "text": text}).encode(),
+                )
+
+            bg = asyncio.ensure_future(_send())
+            self._background_tasks.add(bg)
+            bg.add_done_callback(self._background_tasks.discard)
             return True
-        except OSError:
+        except (OSError, RuntimeError):
+            logger.exception("Failed to send follow-up message via NATS", group_jid=group_jid)
             return False
 
     def close_stdin(self, group_jid: str) -> None:
-        """Signal the active container to wind down."""
+        """Signal the active container to wind down via NATS request-reply."""
         state = self._get_group(group_jid)
-        if not state.active or not state.group_folder:
+        if not state.active or not state.job_id:
             return
 
-        input_dir = DATA_DIR / "ipc" / state.group_folder / "input"
-        try:
-            input_dir.mkdir(parents=True, exist_ok=True)
-            (input_dir / "_close").write_text("")
-        except OSError:
-            pass
+        if self._transport is None:
+            return
+
+        async def _send_close() -> None:
+            assert self._transport is not None
+            assert state.job_id is not None
+            try:
+                await self._transport.nc.request(
+                    f"agent.{state.job_id}.close",
+                    b"close",
+                    timeout=5.0,
+                )
+            except (OSError, TimeoutError):
+                logger.debug("Close signal not acknowledged (agent may have exited)", group_jid=group_jid)
+
+        task = asyncio.ensure_future(_send_close())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     async def _run_for_group(self, group_jid: str, reason: str) -> None:
         state = self._get_group(group_jid)
@@ -221,6 +248,7 @@ class GroupQueue:
             state.process = None
             state.container_name = None
             state.group_folder = None
+            state.job_id = None
             self._active_count -= 1
             self._drain_group(group_jid)
 
@@ -250,6 +278,7 @@ class GroupQueue:
             state.process = None
             state.container_name = None
             state.group_folder = None
+            state.job_id = None
             self._active_count -= 1
             self._drain_group(group_jid)
 
@@ -311,7 +340,7 @@ class GroupQueue:
                 self._spawn(self._run_for_group(next_jid, "drain"))
 
     async def shutdown(self, _grace_period_ms: int = 0) -> None:
-        """Graceful shutdown — detach containers, don't kill them."""
+        """Graceful shutdown -- detach containers, don't kill them."""
         self._shutting_down = True
 
         active_containers: list[str] = []

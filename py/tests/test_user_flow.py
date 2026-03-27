@@ -16,7 +16,6 @@ Mocks are limited to Docker/container spawning — everything else runs for real
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -82,7 +81,6 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr("nanoclaw.core.config.GROUPS_DIR", groups_dir)
     monkeypatch.setattr("nanoclaw.core.config.STORE_DIR", store_dir)
     monkeypatch.setattr("nanoclaw.core.config.POLL_INTERVAL", 0.05)
-    monkeypatch.setattr("nanoclaw.core.config.IPC_POLL_INTERVAL", 0.05)
     monkeypatch.setattr("nanoclaw.core.config.SCHEDULER_POLL_INTERVAL", 0.05)
     monkeypatch.setattr("nanoclaw.core.config.IDLE_TIMEOUT", 2000)
     monkeypatch.setattr("nanoclaw.core.config.TIMEZONE", "UTC")
@@ -95,7 +93,6 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     # Patch modules that captured config at import time
     monkeypatch.setattr("nanoclaw.core.group_folder.DATA_DIR", data_dir)
     monkeypatch.setattr("nanoclaw.core.group_folder.GROUPS_DIR", groups_dir)
-    monkeypatch.setattr("nanoclaw.container.scheduler.DATA_DIR", data_dir)
     monkeypatch.setattr("nanoclaw.main.TIMEZONE", "UTC")
     monkeypatch.setattr("nanoclaw.main.ASSISTANT_NAME", "Andy")
     monkeypatch.setattr(
@@ -190,9 +187,10 @@ def make_agent_mock(
         inp: object,
         on_process: Callable[..., None],
         on_output: Callable[..., Awaitable[None]] | None = None,
+        transport: object | None = None,
     ) -> ContainerOutput:
         captured.append(inp)
-        on_process(object(), "mock-container")
+        on_process(object(), "mock-container", "test-job")
 
         output = ContainerOutput(
             status="success",
@@ -390,7 +388,7 @@ class TestScenarioIPCFromContainer:
         """Agent writes a task IPC file → task created in DB."""
         from nanoclaw.core.types import RegisteredGroup
         from nanoclaw.db.sqlite import get_task_by_id
-        from nanoclaw.ipc.file_transport import process_task_ipc
+        from nanoclaw.ipc.task_handler import process_task_ipc
 
         registered = {
             "tg@test": RegisteredGroup(
@@ -448,14 +446,11 @@ class TestScenarioIPCFromContainer:
         assert task.group_folder == "testgroup"
         assert len(tasks_changed) == 1
 
-    async def test_ipc_message_routing(self, env: Path) -> None:
-        """Agent writes IPC message file → routed to correct channel."""
-        data_dir = env / "data"
-        ipc_dir = data_dir / "ipc" / "mygroup" / "messages"
-        ipc_dir.mkdir(parents=True)
-
-        from nanoclaw.core.types import RegisteredGroup
-        from nanoclaw.ipc.file_transport import _process_ipc_files
+    async def test_ipc_task_pause_resume(self, env: Path) -> None:
+        """Agent pauses and resumes a task via IPC handler."""
+        from nanoclaw.core.types import RegisteredGroup, ScheduledTask
+        from nanoclaw.db.sqlite import create_task, get_task_by_id
+        from nanoclaw.ipc.task_handler import process_task_ipc
 
         registered = {
             "tg@test": RegisteredGroup(
@@ -466,11 +461,11 @@ class TestScenarioIPCFromContainer:
                 is_main=True,
             )
         }
-        sent: list[tuple[str, str]] = []
+        tasks_changed: list[bool] = []
 
         class FakeDeps:
             async def send_message(self, jid: str, text: str) -> None:
-                sent.append((jid, text))
+                pass
 
             def registered_groups(self) -> dict[str, RegisteredGroup]:
                 return registered
@@ -488,25 +483,47 @@ class TestScenarioIPCFromContainer:
                 pass
 
             def on_tasks_changed(self) -> None:
-                pass
+                tasks_changed.append(True)
 
-        # Agent writes an IPC message
-        msg_file = ipc_dir / "001.json"
-        msg_file.write_text(
-            json.dumps(
-                {
-                    "type": "message",
-                    "chatJid": "tg@test",
-                    "text": "Here's the daily report you asked for!",
-                }
+        # Create a task first
+        create_task(
+            ScheduledTask(
+                id="task-pause-test",
+                group_folder="mygroup",
+                chat_jid="tg@test",
+                prompt="Test task",
+                schedule_type="cron",
+                schedule_value="0 9 * * *",
+                context_mode="isolated",
+                next_run="2024-06-01T09:00:00Z",
+                status="active",
+                created_at="2024-01-01T00:00:00Z",
             )
         )
 
-        await _process_ipc_files(data_dir / "ipc", FakeDeps())  # type: ignore[arg-type]
+        # Pause it
+        await process_task_ipc(
+            {"type": "pause_task", "taskId": "task-pause-test"},
+            "mygroup",
+            True,
+            FakeDeps(),  # type: ignore[arg-type]
+        )
+        task = get_task_by_id("task-pause-test")
+        assert task is not None
+        assert task.status == "paused"
+        assert len(tasks_changed) == 1
 
-        assert len(sent) == 1
-        assert sent[0] == ("tg@test", "Here's the daily report you asked for!")
-        assert not msg_file.exists()  # consumed
+        # Resume it
+        await process_task_ipc(
+            {"type": "resume_task", "taskId": "task-pause-test"},
+            "mygroup",
+            True,
+            FakeDeps(),  # type: ignore[arg-type]
+        )
+        task = get_task_by_id("task-pause-test")
+        assert task is not None
+        assert task.status == "active"
+        assert len(tasks_changed) == 2
 
 
 class TestScenarioTaskScheduling:
@@ -623,8 +640,9 @@ class TestScenarioErrorRecovery:
             inp: object,
             on_process: Callable[..., None],
             on_output: Callable[..., Awaitable[None]] | None = None,
+            transport: object | None = None,
         ) -> ContainerOutput:
-            on_process(object(), "crash-container")
+            on_process(object(), "crash-container", "test-job")
             if on_output:
                 await on_output(ContainerOutput(status="error", result=None, error="Segfault"))
             return ContainerOutput(status="error", result=None, error="Segfault")
@@ -653,8 +671,9 @@ class TestScenarioErrorRecovery:
             inp: object,
             on_process: Callable[..., None],
             on_output: Callable[..., Awaitable[None]] | None = None,
+            transport: object | None = None,
         ) -> ContainerOutput:
-            on_process(object(), "partial-container")
+            on_process(object(), "partial-container", "test-job")
             if on_output:
                 # First: send a successful partial output
                 await on_output(

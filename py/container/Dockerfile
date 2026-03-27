@@ -13,17 +13,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python agent SDK (bundles Claude Code CLI)
-RUN pip install --no-cache-dir claude-agent-sdk croniter
+RUN pip install --no-cache-dir claude-agent-sdk croniter nats-py
 
 # Create app directory
 WORKDIR /app
 
-# Copy agent runner code
+# Copy agent runner code and shared IPC protocol
 COPY src/agent_runner/ ./agent_runner/
+COPY src/nanoclaw/ipc/protocol.py ./nanoclaw_ipc_protocol.py
 
-# Create workspace directories
-RUN mkdir -p /workspace/group /workspace/global /workspace/extra \
-    /workspace/ipc/messages /workspace/ipc/tasks /workspace/ipc/input
+# Create workspace directories (no IPC dirs needed — all IPC goes through NATS)
+RUN mkdir -p /workspace/group /workspace/global /workspace/extra
 
 # Create non-root user for sandbox
 RUN useradd -m -s /bin/bash agent || true
@@ -38,5 +38,5 @@ ENV PYTHONPATH=/app
 # Set working directory to group workspace
 WORKDIR /workspace/group
 
-# Entry point reads JSON from stdin, outputs JSON to stdout
+# Entry point reads config from NATS KV, outputs results via NATS JetStream
 ENTRYPOINT ["python", "-m", "agent_runner"]

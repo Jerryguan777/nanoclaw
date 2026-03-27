@@ -29,6 +29,7 @@ from nanoclaw.core.config import (
     ASSISTANT_NAME,
     CREDENTIAL_PROXY_PORT,
     IDLE_TIMEOUT,
+    NATS_URL,
     POLL_INTERVAL,
     TIMEZONE,
     TRIGGER_PATTERN,
@@ -50,7 +51,8 @@ from nanoclaw.db.sqlite import (
     store_chat_metadata,
     store_message,
 )
-from nanoclaw.ipc.file_transport import start_ipc_watcher
+from nanoclaw.ipc.nats_transport import NatsTransport
+from nanoclaw.ipc.task_handler import process_task_ipc
 from nanoclaw.orchestration.remote_control import (
     restore_remote_control,
     start_remote_control,
@@ -87,6 +89,8 @@ _message_loop_running: bool = False
 
 _channels: list[Channel] = []
 _queue: GroupQueue = GroupQueue()
+_transport: NatsTransport | None = None
+_bg_tasks: set[asyncio.Task[None]] = set()
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +167,85 @@ def _set_registered_groups(groups: dict[str, RegisteredGroup]) -> None:
     """Set registered groups (for testing)."""
     global _registered_groups
     _registered_groups = groups
+
+
+# ---------------------------------------------------------------------------
+# NATS subscription handlers (replace file-based IPC watcher)
+# ---------------------------------------------------------------------------
+
+
+async def _start_nats_ipc_subscriptions(transport: NatsTransport, deps: _IpcDepsImpl) -> list[asyncio.Task[None]]:
+    """Subscribe to NATS subjects for agent IPC messages and tasks.
+
+    Replaces the file-based IPC watcher (start_ipc_watcher).
+    Returns background tasks that should be cancelled on shutdown.
+    """
+    tasks: list[asyncio.Task[None]] = []
+
+    # Subscribe to agent messages (Channel 4: agent -> user)
+    messages_sub = await transport.js.subscribe("agent.*.messages")
+
+    async def _handle_messages() -> None:
+        async for msg in messages_sub.messages:
+            try:
+                data = json.loads(msg.data)
+                if data.get("type") == "message" and data.get("chatJid") and data.get("text"):
+                    chat_jid = data["chatJid"]
+                    source_group = data.get("groupFolder", "")
+
+                    # Authorization
+                    registered_groups = deps.registered_groups()
+                    # Determine if source is main
+                    folder_is_main: dict[str, bool] = {}
+                    for group in registered_groups.values():
+                        if group.is_main:
+                            folder_is_main[group.folder] = True
+                    is_main = folder_is_main.get(source_group, False)
+
+                    target_group = registered_groups.get(chat_jid)
+                    if is_main or (target_group is not None and target_group.folder == source_group):
+                        await deps.send_message(chat_jid, data["text"])
+                        logger.info("NATS IPC message sent", chat_jid=chat_jid, source_group=source_group)
+                    else:
+                        logger.warning(
+                            "Unauthorized IPC message attempt blocked",
+                            chat_jid=chat_jid,
+                            source_group=source_group,
+                        )
+                await msg.ack()
+            except Exception:
+                logger.exception("Error processing NATS IPC message")
+                await msg.ack()
+
+    tasks.append(asyncio.create_task(_handle_messages()))
+
+    # Subscribe to agent tasks (Channel 5: agent -> orch)
+    tasks_sub = await transport.js.subscribe("agent.*.tasks")
+
+    async def _handle_tasks() -> None:
+        async for msg in tasks_sub.messages:
+            try:
+                data = json.loads(msg.data)
+                source_group = data.get("groupFolder", data.get("createdBy", ""))
+
+                # Determine is_main
+                registered_groups = deps.registered_groups()
+                folder_is_main: dict[str, bool] = {}
+                for group in registered_groups.values():
+                    if group.is_main:
+                        folder_is_main[group.folder] = True
+                is_main = folder_is_main.get(source_group, False)
+
+                await process_task_ipc(data, source_group, is_main, deps)
+                await msg.ack()
+            except Exception:
+                logger.exception("Error processing NATS IPC task")
+                await msg.ack()
+
+    tasks.append(asyncio.create_task(_handle_tasks()))
+
+    logger.info("NATS IPC subscriptions started")
+    return tasks
 
 
 # ---------------------------------------------------------------------------
@@ -291,33 +374,35 @@ async def _run_agent(
     is_main = group.is_main
     session_id = _sessions.get(group.folder)
 
-    # Update tasks snapshot for container to read
-    tasks = get_all_tasks()
-    write_tasks_snapshot(
-        group.folder,
-        is_main,
-        [
-            {
-                "id": t.id,
-                "groupFolder": t.group_folder,
-                "prompt": t.prompt,
-                "schedule_type": t.schedule_type,
-                "schedule_value": t.schedule_value,
-                "status": t.status,
-                "next_run": t.next_run,
-            }
-            for t in tasks
-        ],
-    )
+    # Update snapshots in NATS KV for container to read (Channel 6)
+    if _transport is not None:
+        tasks = get_all_tasks()
+        await write_tasks_snapshot(
+            _transport,
+            group.folder,
+            is_main,
+            [
+                {
+                    "id": t.id,
+                    "groupFolder": t.group_folder,
+                    "prompt": t.prompt,
+                    "schedule_type": t.schedule_type,
+                    "schedule_value": t.schedule_value,
+                    "status": t.status,
+                    "next_run": t.next_run,
+                }
+                for t in tasks
+            ],
+        )
 
-    # Update available groups snapshot
-    available_groups = get_available_groups()
-    write_groups_snapshot(
-        group.folder,
-        is_main,
-        available_groups,
-        set(_registered_groups.keys()),
-    )
+        available_groups = get_available_groups()
+        await write_groups_snapshot(
+            _transport,
+            group.folder,
+            is_main,
+            available_groups,
+            set(_registered_groups.keys()),
+        )
 
     # Wrap on_output to track session ID from streamed results
     wrapped_on_output = None
@@ -343,8 +428,11 @@ async def _run_agent(
                 is_main=is_main,
                 assistant_name=ASSISTANT_NAME,
             ),
-            lambda proc, container_name: _queue.register_process(chat_jid, proc, container_name, group.folder),
+            lambda proc, container_name, job_id: _queue.register_process(
+                chat_jid, proc, container_name, group.folder, job_id
+            ),
             wrapped_on_output,
+            transport=_transport,
         )
 
         if output.new_session_id:
@@ -509,11 +597,28 @@ async def _handle_remote_control(command: str, chat_jid: str, msg: NewMessage) -
 
 async def main() -> None:
     """Entry point for the NanoClaw orchestrator."""
+    global _transport, _queue
+
     _ensure_container_system_running()
     init_database()
     logger.info("Database initialized")
     _load_state()
     restore_remote_control()
+
+    # Connect to NATS for IPC
+    _transport = NatsTransport(NATS_URL)
+    try:
+        await _transport.connect()
+    except ConnectionError:
+        logger.critical(
+            "Failed to connect to NATS — is it running?",
+            url=NATS_URL,
+            hint="docker compose -f docker-compose.dev.yml up -d",
+        )
+        sys.exit(1)
+
+    # Create queue with transport
+    _queue = GroupQueue(transport=_transport)
 
     # Start credential proxy (containers route API calls through this)
     proxy_runner = await start_credential_proxy(CREDENTIAL_PROXY_PORT, PROXY_BIND_HOST)
@@ -587,7 +692,11 @@ async def main() -> None:
 
     # Start subsystems
     start_scheduler_loop(_SchedulerDepsImpl())
-    start_ipc_watcher(_IpcDepsImpl())
+
+    # Start NATS IPC subscriptions (replaces file-based IPC watcher)
+    ipc_deps = _IpcDepsImpl()
+    ipc_tasks = await _start_nats_ipc_subscriptions(_transport, ipc_deps)
+
     _queue.set_process_messages_fn(_process_group_messages)
     _recover_pending_messages()
 
@@ -595,10 +704,16 @@ async def main() -> None:
     await _message_loop(shutdown_event)
 
     # Cleanup
+    for t in ipc_tasks:
+        t.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await t
+
     await proxy_runner.cleanup()
     await _queue.shutdown(10000)
     for ch in _channels:
         await ch.disconnect()
+    await _transport.close()
 
 
 # ---------------------------------------------------------------------------
@@ -625,8 +740,13 @@ class _SchedulerDepsImpl:
         proc: object,
         container_name: str,
         group_folder: str,
+        job_id: str | None = None,
     ) -> None:
-        _queue.register_process(group_jid, proc, container_name, group_folder)
+        _queue.register_process(group_jid, proc, container_name, group_folder, job_id)
+
+    @property
+    def transport(self) -> NatsTransport | None:
+        return _transport
 
     async def send_message(self, jid: str, raw_text: str) -> None:
         channel = find_channel(_channels, jid)
@@ -671,9 +791,16 @@ class _IpcDepsImpl:
         available_groups: list[AvailableGroup],
         registered_jids: set[str],
     ) -> None:
-        write_groups_snapshot(group_folder, is_main, available_groups, registered_jids)
+        if _transport is not None:
+            t = asyncio.ensure_future(
+                write_groups_snapshot(_transport, group_folder, is_main, available_groups, registered_jids)
+            )
+            _bg_tasks.add(t)
+            t.add_done_callback(_bg_tasks.discard)
 
     def on_tasks_changed(self) -> None:
+        if _transport is None:
+            return
         tasks = get_all_tasks()
         task_rows: list[dict[str, object]] = [
             {
@@ -687,8 +814,15 @@ class _IpcDepsImpl:
             }
             for t in tasks
         ]
-        for group in _registered_groups.values():
-            write_tasks_snapshot(group.folder, group.is_main, task_rows)
+
+        async def _update_snapshots() -> None:
+            assert _transport is not None
+            for group in _registered_groups.values():
+                await write_tasks_snapshot(_transport, group.folder, group.is_main, task_rows)
+
+        t = asyncio.ensure_future(_update_snapshots())
+        _bg_tasks.add(t)
+        t.add_done_callback(_bg_tasks.discard)
 
 
 # ---------------------------------------------------------------------------

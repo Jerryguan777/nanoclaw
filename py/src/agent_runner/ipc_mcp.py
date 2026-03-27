@@ -1,37 +1,24 @@
 """
 NanoClaw in-process MCP server.
 
-Defines MCP tools that write IPC files for the host process to consume.
+Defines MCP tools that publish to NATS for the host process to consume.
 Uses create_sdk_mcp_server / @tool for in-process registration (no stdio).
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
 from datetime import datetime
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 from croniter import croniter
 
-IPC_DIR = Path("/workspace/ipc")
-MESSAGES_DIR = IPC_DIR / "messages"
-TASKS_DIR = IPC_DIR / "tasks"
-
-
-def _write_ipc_file(directory: Path, data: dict[str, Any]) -> str:
-    """Atomically write a JSON IPC file and return the filename."""
-    directory.mkdir(parents=True, exist_ok=True)
-    rand_suffix = f"{time.time_ns() % 10**8:08x}"
-    filename = f"{int(time.time() * 1000)}-{rand_suffix}.json"
-    filepath = directory / filename
-    temp_path = filepath.with_suffix(".json.tmp")
-    temp_path.write_text(json.dumps(data, indent=2))
-    temp_path.rename(filepath)
-    return filename
+if TYPE_CHECKING:
+    from nats.js.client import JetStreamContext
 
 
 def _text_result(text: str, *, is_error: bool = False) -> dict[str, Any]:
@@ -46,8 +33,20 @@ def create_nanoclaw_mcp_server(
     chat_jid: str,
     group_folder: str,
     is_main: bool,
+    js: JetStreamContext,
+    job_id: str,
 ) -> Any:
     """Create and return an in-process MCP server with all NanoClaw tools."""
+
+    _bg_tasks: set[asyncio.Task[None]] = set()
+
+    def _publish(subject: str, data: dict[str, Any]) -> None:
+        """Publish a JSON message to NATS JetStream (fire-and-forget)."""
+        task = asyncio.ensure_future(
+            js.publish(subject, json.dumps(data, indent=2).encode())  # type: ignore[arg-type]
+        )
+        _bg_tasks.add(task)
+        task.add_done_callback(_bg_tasks.discard)
 
     # --- send_message ---
     @tool(
@@ -66,7 +65,7 @@ def create_nanoclaw_mcp_server(
         }
         if args.get("sender"):
             data["sender"] = args["sender"]
-        _write_ipc_file(MESSAGES_DIR, data)
+        _publish(f"agent.{job_id}.messages", data)
         return _text_result("Message sent.")
 
     # --- schedule_task ---
@@ -125,8 +124,8 @@ def create_nanoclaw_mcp_server(
         rand_suffix = f"{time.time_ns() % 10**8:08x}"
         task_id = f"task-{int(time.time() * 1000)}-{rand_suffix}"
 
-        _write_ipc_file(
-            TASKS_DIR,
+        _publish(
+            f"agent.{job_id}.tasks",
             {
                 "type": "schedule_task",
                 "taskId": task_id,
@@ -136,6 +135,7 @@ def create_nanoclaw_mcp_server(
                 "context_mode": context_mode or "group",
                 "targetJid": target_jid,
                 "createdBy": group_folder,
+                "groupFolder": group_folder,
                 "timestamp": datetime.now().isoformat(),
             },
         )
@@ -144,11 +144,10 @@ def create_nanoclaw_mcp_server(
     # --- list_tasks ---
     @tool("list_tasks", "List all scheduled tasks.", {})
     async def list_tasks(args: dict[str, Any]) -> dict[str, Any]:
-        tasks_file = IPC_DIR / "current_tasks.json"
         try:
-            if not tasks_file.exists():
-                return _text_result("No scheduled tasks found.")
-            all_tasks: list[dict[str, Any]] = json.loads(tasks_file.read_text())
+            kv = await js.key_value("snapshots")
+            entry = await kv.get(f"{group_folder}.tasks")
+            all_tasks: list[dict[str, Any]] = json.loads(entry.value)
             tasks = all_tasks if is_main else [t for t in all_tasks if t.get("groupFolder") == group_folder]
             if not tasks:
                 return _text_result("No scheduled tasks found.")
@@ -166,8 +165,8 @@ def create_nanoclaw_mcp_server(
     @tool("pause_task", "Pause a scheduled task.", {"task_id": str})
     async def pause_task(args: dict[str, Any]) -> dict[str, Any]:
         task_id = args["task_id"]
-        _write_ipc_file(
-            TASKS_DIR,
+        _publish(
+            f"agent.{job_id}.tasks",
             {
                 "type": "pause_task",
                 "taskId": task_id,
@@ -182,8 +181,8 @@ def create_nanoclaw_mcp_server(
     @tool("resume_task", "Resume a paused task.", {"task_id": str})
     async def resume_task(args: dict[str, Any]) -> dict[str, Any]:
         task_id = args["task_id"]
-        _write_ipc_file(
-            TASKS_DIR,
+        _publish(
+            f"agent.{job_id}.tasks",
             {
                 "type": "resume_task",
                 "taskId": task_id,
@@ -198,8 +197,8 @@ def create_nanoclaw_mcp_server(
     @tool("cancel_task", "Cancel and delete a scheduled task.", {"task_id": str})
     async def cancel_task(args: dict[str, Any]) -> dict[str, Any]:
         task_id = args["task_id"]
-        _write_ipc_file(
-            TASKS_DIR,
+        _publish(
+            f"agent.{job_id}.tasks",
             {
                 "type": "cancel_task",
                 "taskId": task_id,
@@ -248,7 +247,7 @@ def create_nanoclaw_mcp_server(
         if sval is not None:
             data["schedule_value"] = sval
 
-        _write_ipc_file(TASKS_DIR, data)
+        _publish(f"agent.{job_id}.tasks", data)
         return _text_result(f"Task {task_id} update requested.")
 
     # --- register_group ---
@@ -260,14 +259,15 @@ def create_nanoclaw_mcp_server(
     async def register_group(args: dict[str, Any]) -> dict[str, Any]:
         if not is_main:
             return _text_result("Only the main group can register new groups.", is_error=True)
-        _write_ipc_file(
-            TASKS_DIR,
+        _publish(
+            f"agent.{job_id}.tasks",
             {
                 "type": "register_group",
                 "jid": args["jid"],
                 "name": args["name"],
                 "folder": args["folder"],
                 "trigger": args["trigger"],
+                "groupFolder": group_folder,
                 "timestamp": datetime.now().isoformat(),
             },
         )
@@ -275,5 +275,5 @@ def create_nanoclaw_mcp_server(
 
     return create_sdk_mcp_server(
         "nanoclaw",
-        [send_message, schedule_task, list_tasks, pause_task, resume_task, cancel_task, update_task, register_group],
+        tools=[send_message, schedule_task, list_tasks, pause_task, resume_task, cancel_task, update_task, register_group],
     )
