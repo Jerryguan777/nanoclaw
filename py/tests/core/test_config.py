@@ -9,6 +9,7 @@ from nanoclaw.core.config import (
     GROUPS_DIR,
     IDLE_TIMEOUT,
     MAX_CONCURRENT_CONTAINERS,
+    NATS_URL,
     POLL_INTERVAL,
     TRIGGER_PATTERN,
 )
@@ -39,3 +40,8 @@ def test_trigger_pattern() -> None:
 def test_container_image() -> None:
     assert isinstance(CONTAINER_IMAGE, str)
     assert "nanoclaw" in CONTAINER_IMAGE
+
+
+def test_nats_url_default() -> None:
+    assert isinstance(NATS_URL, str)
+    assert NATS_URL.startswith("nats://")

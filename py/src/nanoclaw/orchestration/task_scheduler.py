@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable
 
     from nanoclaw.container.scheduler import GroupQueue
+    from nanoclaw.ipc.nats_transport import NatsTransport
 
 logger = get_logger()
 
@@ -95,6 +96,8 @@ class SchedulerDependencies(Protocol):
         group_folder: str,
     ) -> None: ...
     def send_message(self, jid: str, text: str) -> Awaitable[None]: ...
+    @property
+    def transport(self) -> NatsTransport | None: ...
 
 
 _TASK_CLOSE_DELAY_S: float = 10.0
@@ -148,25 +151,28 @@ async def _run_task(
         )
         return
 
-    # Update tasks snapshot for container to read (filtered by group)
+    # Update tasks snapshot in NATS KV for container to read (Channel 6)
     is_main = group.is_main
-    all_tasks = get_all_tasks()
-    write_tasks_snapshot(
-        task.group_folder,
-        is_main,
-        [
-            {
-                "id": t.id,
-                "groupFolder": t.group_folder,
-                "prompt": t.prompt,
-                "schedule_type": t.schedule_type,
-                "schedule_value": t.schedule_value,
-                "status": t.status,
-                "next_run": t.next_run,
-            }
-            for t in all_tasks
-        ],
-    )
+    transport = deps.transport
+    if transport is not None:
+        all_tasks = get_all_tasks()
+        await write_tasks_snapshot(
+            transport,
+            task.group_folder,
+            is_main,
+            [
+                {
+                    "id": t.id,
+                    "groupFolder": t.group_folder,
+                    "prompt": t.prompt,
+                    "schedule_type": t.schedule_type,
+                    "schedule_value": t.schedule_value,
+                    "status": t.status,
+                    "next_run": t.next_run,
+                }
+                for t in all_tasks
+            ],
+        )
 
     result: str | None = None
     error: str | None = None
@@ -215,6 +221,7 @@ async def _run_task(
             ),
             lambda proc, container_name: deps.on_process(task.chat_jid, proc, container_name, task.group_folder),
             _on_output,
+            transport=transport,
         )
 
         if close_handle is not None:

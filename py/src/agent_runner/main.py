@@ -1,18 +1,16 @@
 """
 NanoClaw Agent Runner (Python)
 
-Runs inside a Docker container, receives config via stdin, outputs result to stdout.
+Runs inside a Docker container with NATS-based IPC.
 
 Input protocol:
-  Stdin: Full ContainerInput JSON (read until EOF)
-  IPC:   Follow-up messages written as JSON files to /workspace/ipc/input/
-         Files: {type:"message", text:"..."}.json -- polled and consumed
-         Sentinel: /workspace/ipc/input/_close -- signals session end
+  NATS KV: Reads initial config from KV bucket "agent-init" key JOB_ID
+  NATS JetStream: Follow-up messages via agent.{JOB_ID}.input
+  NATS request-reply: Close signal via agent.{JOB_ID}.close
 
-Stdout protocol:
-  Each result is wrapped in OUTPUT_START_MARKER / OUTPUT_END_MARKER pairs.
-  Multiple results may be emitted (one per agent teams result).
-  Final marker after loop ends signals completion.
+Output protocol:
+  NATS JetStream: Results published to agent.{JOB_ID}.results
+  NATS JetStream: Messages and tasks via agent.{JOB_ID}.messages / .tasks
 """
 
 from __future__ import annotations
@@ -20,18 +18,23 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import nats
 from claude_agent_sdk import ClaudeAgentOptions, HookMatcher, query
 
 from .ipc_mcp import create_nanoclaw_mcp_server
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
+
+    from nats.aio.client import Client
+    from nats.js.client import JetStreamContext
 
 # ---------------------------------------------------------------------------
 # Types
@@ -83,12 +86,8 @@ class ParsedMessage:
 # Constants
 # ---------------------------------------------------------------------------
 
-IPC_INPUT_DIR = Path("/workspace/ipc/input")
-IPC_INPUT_CLOSE_SENTINEL = IPC_INPUT_DIR / "_close"
-IPC_POLL_SECONDS = 0.5
-
-OUTPUT_START_MARKER = "---NANOCLAW_OUTPUT_START---"
-OUTPUT_END_MARKER = "---NANOCLAW_OUTPUT_END---"
+NATS_URL = os.environ.get("NATS_URL", "nats://localhost:4222")
+JOB_ID = os.environ.get("JOB_ID", "")
 
 
 # ---------------------------------------------------------------------------
@@ -135,13 +134,6 @@ class MessageStream:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def write_output(output: ContainerOutput) -> None:
-    print(OUTPUT_START_MARKER)
-    print(json.dumps(output.to_dict()))
-    print(OUTPUT_END_MARKER)
-    sys.stdout.flush()
 
 
 def log(message: str) -> None:
@@ -282,49 +274,80 @@ def create_pre_compact_hook(
 
 
 # ---------------------------------------------------------------------------
-# IPC polling helpers
+# NATS helpers for IPC
 # ---------------------------------------------------------------------------
 
 
-def should_close() -> bool:
-    if IPC_INPUT_CLOSE_SENTINEL.exists():
-        with contextlib.suppress(OSError):
-            IPC_INPUT_CLOSE_SENTINEL.unlink()
-        return True
-    return False
+async def publish_output(js: JetStreamContext, job_id: str, output: ContainerOutput) -> None:
+    """Publish a result to JetStream (Channel 2)."""
+    await js.publish(
+        f"agent.{job_id}.results",
+        json.dumps(output.to_dict()).encode(),
+    )
 
 
-def drain_ipc_input() -> list[str]:
+async def wait_for_nats_message(
+    nc: Client,
+    js: JetStreamContext,
+    job_id: str,
+) -> str | None:
+    """Wait for a new NATS input message or close signal.
+
+    Returns the message text, or None if close signal received.
+    """
+    result_text: str | None = None
+    close_received = asyncio.Event()
+    message_received = asyncio.Event()
+
+    # Subscribe to follow-up messages (Channel 3)
+    input_sub = await js.subscribe(f"agent.{job_id}.input")
+
+    # Subscribe to close signal (Channel 3 - request-reply)
+    async def handle_close(msg: Any) -> None:
+        await msg.respond(b"ack")
+        close_received.set()
+
+    close_sub = await nc.subscribe(f"agent.{job_id}.close", cb=handle_close)
+
     try:
-        IPC_INPUT_DIR.mkdir(parents=True, exist_ok=True)
-        files = sorted(f for f in IPC_INPUT_DIR.iterdir() if f.suffix == ".json")
-
-        messages: list[str] = []
-        for filepath in files:
+        while True:
+            # Check for input messages
             try:
-                data = json.loads(filepath.read_text())
-                filepath.unlink()
+                msg = await asyncio.wait_for(input_sub.next_msg(timeout=0.5), timeout=0.5)
+                data = json.loads(msg.data)
+                await msg.ack()
+                if data.get("type") == "message" and data.get("text"):
+                    result_text = data["text"]
+                    message_received.set()
+            except TimeoutError:
+                pass
+
+            if close_received.is_set():
+                return None
+            if message_received.is_set():
+                return result_text
+    finally:
+        await input_sub.unsubscribe()
+        await close_sub.unsubscribe()
+
+
+async def drain_nats_input(js: JetStreamContext, job_id: str) -> list[str]:
+    """Drain any pending input messages from NATS."""
+    messages: list[str] = []
+    sub = await js.subscribe(f"agent.{job_id}.input")
+    try:
+        while True:
+            try:
+                msg = await asyncio.wait_for(sub.next_msg(timeout=0.1), timeout=0.1)
+                data = json.loads(msg.data)
+                await msg.ack()
                 if data.get("type") == "message" and data.get("text"):
                     messages.append(data["text"])
-            except (OSError, json.JSONDecodeError, KeyError, ValueError, RuntimeError) as exc:
-                log(f"Failed to process input file {filepath.name}: {exc}")
-                with contextlib.suppress(OSError):
-                    filepath.unlink()
-        return messages
-    except (OSError, json.JSONDecodeError, KeyError, ValueError, RuntimeError) as exc:
-        log(f"IPC drain error: {exc}")
-        return []
-
-
-async def wait_for_ipc_message() -> str | None:
-    """Wait for a new IPC message or _close sentinel."""
-    while True:
-        if should_close():
-            return None
-        messages = drain_ipc_input()
-        if messages:
-            return "\n".join(messages)
-        await asyncio.sleep(IPC_POLL_SECONDS)
+            except TimeoutError:
+                break
+    finally:
+        await sub.unsubscribe()
+    return messages
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +368,9 @@ async def run_query(
     mcp_server: Any,
     container_input: ContainerInput,
     sdk_env: dict[str, str | None],
+    nc: Client,
+    js: JetStreamContext,
+    job_id: str,
     resume_at: str | None = None,
 ) -> QueryResult:
     stream = MessageStream()
@@ -353,20 +379,37 @@ async def run_query(
     result = QueryResult()
     ipc_polling = True
 
-    async def poll_ipc_during_query() -> None:
+    # Subscribe to close signal
+    close_received = asyncio.Event()
+
+    async def handle_close(msg: Any) -> None:
+        await msg.respond(b"ack")
+        close_received.set()
+
+    close_sub = await nc.subscribe(f"agent.{job_id}.close", cb=handle_close)
+
+    # Subscribe to follow-up input messages
+    input_sub = await js.subscribe(f"agent.{job_id}.input")
+
+    async def poll_nats_during_query() -> None:
         nonlocal ipc_polling
         while ipc_polling:
-            if should_close():
-                log("Close sentinel detected during query, ending stream")
+            if close_received.is_set():
+                log("Close signal detected during query, ending stream")
                 result.closed_during_query = True
                 stream.end()
                 ipc_polling = False
                 return
-            messages = drain_ipc_input()
-            for text in messages:
-                log(f"Piping IPC message into active query ({len(text)} chars)")
-                stream.push(text)
-            await asyncio.sleep(IPC_POLL_SECONDS)
+            try:
+                msg = await asyncio.wait_for(input_sub.next_msg(timeout=0.5), timeout=0.5)
+                data = json.loads(msg.data)
+                await msg.ack()
+                if data.get("type") == "message" and data.get("text"):
+                    text = data["text"]
+                    log(f"Piping NATS message into active query ({len(text)} chars)")
+                    stream.push(text)
+            except TimeoutError:
+                pass
 
     # Load global CLAUDE.md as additional system context (shared across all groups)
     global_claude_md_path = Path("/workspace/global/CLAUDE.md")
@@ -439,14 +482,13 @@ async def run_query(
     message_count = 0
     result_count = 0
 
-    # Start IPC polling as a background task (not in the same task group as query)
-    poll_task = asyncio.ensure_future(poll_ipc_during_query())
+    # Start NATS polling as a background task
+    poll_task = asyncio.ensure_future(poll_nats_during_query())
 
     try:
         async for message in query(prompt=stream, options=options):
             message_count += 1
 
-            # Determine message type from the object class name
             cls_name = type(message).__name__
             log_type = cls_name
 
@@ -481,21 +523,25 @@ async def run_query(
                     result.new_session_id = session_id_from_result
                 preview = text_result[:200] if text_result else ""
                 log(f"Result #{result_count}: subtype={subtype}{f' text={preview}' if text_result else ''}")
-                write_output(
+                await publish_output(
+                    js,
+                    job_id,
                     ContainerOutput(
                         status="success",
                         result=text_result or None,
                         new_session_id=result.new_session_id,
-                    )
+                    ),
                 )
 
             log(f"[msg #{message_count}] type={log_type}")
     finally:
-        # Stop IPC polling once the query iterator ends
+        # Stop NATS polling once the query iterator ends
         ipc_polling = False
         poll_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await poll_task
+        await input_sub.unsubscribe()
+        await close_sub.unsubscribe()
 
     log(
         f"Query done. Messages: {message_count}, results: {result_count}, "
@@ -511,36 +557,45 @@ async def run_query(
 
 
 async def main() -> None:
-    # Read ContainerInput JSON from stdin
+    if not JOB_ID:
+        log("JOB_ID environment variable not set")
+        sys.exit(1)
+
+    # Connect to NATS
+    nc = await nats.connect(NATS_URL)
+    js = nc.jetstream()
+    log(f"Connected to NATS at {NATS_URL}")
+
+    # Channel 1: Read initial input from KV
     try:
-        stdin_data = sys.stdin.read()
-        raw = json.loads(stdin_data)
+        kv = await js.key_value("agent-init")
+        entry = await kv.get(JOB_ID)
+        raw = json.loads(entry.value)
         container_input = ContainerInput(
             prompt=raw["prompt"],
-            group_folder=raw["groupFolder"],
-            chat_jid=raw["chatJid"],
-            is_main=raw["isMain"],
-            session_id=raw.get("sessionId"),
-            is_scheduled_task=raw.get("isScheduledTask", False),
-            assistant_name=raw.get("assistantName"),
+            group_folder=raw["group_folder"],
+            chat_jid=raw["chat_jid"],
+            is_main=raw["is_main"],
+            session_id=raw.get("session_id"),
+            is_scheduled_task=raw.get("is_scheduled_task", False),
+            assistant_name=raw.get("assistant_name"),
         )
-        with contextlib.suppress(OSError):
-            Path("/tmp/input.json").unlink()
         log(f"Received input for group: {container_input.group_folder}")
     except (OSError, json.JSONDecodeError, KeyError, ValueError, RuntimeError) as exc:
-        write_output(
+        log(f"Failed to read initial input from NATS KV: {exc}")
+        await publish_output(
+            js,
+            JOB_ID,
             ContainerOutput(
                 status="error",
                 result=None,
-                error=f"Failed to parse input: {exc}",
-            )
+                error=f"Failed to read input from NATS KV: {exc}",
+            ),
         )
+        await nc.close()
         sys.exit(1)
 
     # Credentials are injected by the host's credential proxy via ANTHROPIC_BASE_URL.
-    # No real secrets exist in the container environment.
-    import os
-
     sdk_env: dict[str, str | None] = dict(os.environ)
 
     # Create in-process MCP server
@@ -548,28 +603,25 @@ async def main() -> None:
         chat_jid=container_input.chat_jid,
         group_folder=container_input.group_folder,
         is_main=container_input.is_main,
+        js=js,
+        job_id=JOB_ID,
     )
 
     session_id = container_input.session_id
-    IPC_INPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Clean up stale _close sentinel from previous container runs
-    with contextlib.suppress(OSError):
-        IPC_INPUT_CLOSE_SENTINEL.unlink()
-
-    # Build initial prompt (drain any pending IPC messages too)
+    # Build initial prompt (drain any pending NATS messages too)
     prompt = container_input.prompt
     if container_input.is_scheduled_task:
         prompt = (
             "[SCHEDULED TASK - The following message was sent automatically "
             "and is not coming directly from the user or group.]\n\n" + prompt
         )
-    pending = drain_ipc_input()
+    pending = await drain_nats_input(js, JOB_ID)
     if pending:
-        log(f"Draining {len(pending)} pending IPC messages into initial prompt")
+        log(f"Draining {len(pending)} pending NATS messages into initial prompt")
         prompt += "\n" + "\n".join(pending)
 
-    # Query loop: run query -> wait for IPC message -> run new query -> repeat
+    # Query loop: run query -> wait for NATS message -> run new query -> repeat
     resume_at: str | None = None
     try:
         while True:
@@ -581,6 +633,9 @@ async def main() -> None:
                 mcp_server,
                 container_input,
                 sdk_env,
+                nc,
+                js,
+                JOB_ID,
                 resume_at,
             )
             if query_result.new_session_id:
@@ -588,26 +643,28 @@ async def main() -> None:
             if query_result.last_assistant_uuid:
                 resume_at = query_result.last_assistant_uuid
 
-            # If _close was consumed during the query, exit immediately.
+            # If close was consumed during the query, exit immediately.
             if query_result.closed_during_query:
-                log("Close sentinel consumed during query, exiting")
+                log("Close signal consumed during query, exiting")
                 break
 
             # Emit session update so host can track it
-            write_output(
+            await publish_output(
+                js,
+                JOB_ID,
                 ContainerOutput(
                     status="success",
                     result=None,
                     new_session_id=session_id,
-                )
+                ),
             )
 
-            log("Query ended, waiting for next IPC message...")
+            log("Query ended, waiting for next NATS message...")
 
-            # Wait for the next message or _close sentinel
-            next_message = await wait_for_ipc_message()
+            # Wait for the next message or close signal
+            next_message = await wait_for_nats_message(nc, js, JOB_ID)
             if next_message is None:
-                log("Close sentinel received, exiting")
+                log("Close signal received, exiting")
                 break
 
             log(f"Got new message ({len(next_message)} chars), starting new query")
@@ -615,12 +672,17 @@ async def main() -> None:
     except (OSError, json.JSONDecodeError, KeyError, ValueError, RuntimeError) as exc:
         error_message = str(exc)
         log(f"Agent error: {error_message}")
-        write_output(
+        await publish_output(
+            js,
+            JOB_ID,
             ContainerOutput(
                 status="error",
                 result=None,
                 new_session_id=session_id,
                 error=error_message,
-            )
+            ),
         )
+        await nc.close()
         sys.exit(1)
+
+    await nc.close()

@@ -1,9 +1,9 @@
-"""Tests for nanoclaw.ipc."""
+"""Tests for nanoclaw.ipc task handler (extracted from file_transport)."""
 
 from __future__ import annotations
 
 from nanoclaw.db.sqlite import _init_test_database
-from nanoclaw.ipc.file_transport import process_task_ipc
+from nanoclaw.ipc.task_handler import process_task_ipc
 
 
 def setup_function() -> None:

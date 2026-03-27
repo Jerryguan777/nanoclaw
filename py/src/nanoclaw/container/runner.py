@@ -1,6 +1,7 @@
-"""Container spawning and JSON I/O protocol.
+"""Container spawning with NATS-based IPC.
 
-Spawns agent execution in containers and handles streaming output parsing.
+Spawns agent execution in containers. All communication between the
+Orchestrator and Agent happens over NATS (KV + JetStream + request-reply).
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import os
 import re
 import shutil
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal
@@ -31,10 +33,11 @@ from nanoclaw.core.config import (
     DATA_DIR,
     GROUPS_DIR,
     IDLE_TIMEOUT,
+    NATS_URL,
     PROJECT_ROOT,
     TIMEZONE,
 )
-from nanoclaw.core.group_folder import resolve_group_folder_path, resolve_group_ipc_path
+from nanoclaw.core.group_folder import resolve_group_folder_path
 from nanoclaw.core.logger import get_logger
 from nanoclaw.security.credential_proxy import detect_auth_mode
 from nanoclaw.security.mount_security import validate_additional_mounts
@@ -43,17 +46,14 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from nanoclaw.core.types import RegisteredGroup
+    from nanoclaw.ipc.nats_transport import NatsTransport
 
 logger = get_logger()
-
-# Sentinel markers for robust output parsing (must match agent-runner)
-OUTPUT_START_MARKER: str = "---NANOCLAW_OUTPUT_START---"
-OUTPUT_END_MARKER: str = "---NANOCLAW_OUTPUT_END---"
 
 
 @dataclass
 class ContainerInput:
-    """Input payload sent to the container agent via stdin."""
+    """Input payload for the container agent."""
 
     prompt: str
     group_folder: str
@@ -93,26 +93,6 @@ class AvailableGroup:
     is_registered: bool
 
 
-def _serialize_container_input(inp: ContainerInput) -> dict[str, object]:
-    """Serialize ContainerInput to a JSON-compatible dict using camelCase keys.
-
-    Matches the TypeScript interface expected by the container agent-runner.
-    """
-    d: dict[str, object] = {
-        "prompt": inp.prompt,
-        "groupFolder": inp.group_folder,
-        "chatJid": inp.chat_jid,
-        "isMain": inp.is_main,
-    }
-    if inp.session_id is not None:
-        d["sessionId"] = inp.session_id
-    if inp.is_scheduled_task:
-        d["isScheduledTask"] = inp.is_scheduled_task
-    if inp.assistant_name is not None:
-        d["assistantName"] = inp.assistant_name
-    return d
-
-
 def _parse_container_output(raw: dict[str, object]) -> ContainerOutput:
     """Parse a raw JSON dict into a ContainerOutput, handling camelCase keys."""
     result_val = raw.get("result")
@@ -140,10 +120,7 @@ def build_volume_mounts(
 
     if is_main:
         # Main gets the project root read-only. Writable paths the agent needs
-        # (group folder, IPC, .claude/) are mounted separately below.
-        # Read-only prevents the agent from modifying host application code
-        # (src/, dist/, package.json, etc.) which would bypass the sandbox
-        # entirely on next restart.
+        # (group folder, .claude/) are mounted separately below.
         mounts.append(
             VolumeMount(
                 host_path=str(project_root),
@@ -153,7 +130,6 @@ def build_volume_mounts(
         )
 
         # Shadow .env so the agent cannot read secrets from the mounted project root.
-        # Credentials are injected by the credential proxy, never exposed to containers.
         env_file = project_root / ".env"
         if env_file.exists():
             mounts.append(
@@ -183,7 +159,6 @@ def build_volume_mounts(
         )
 
         # Global memory directory (read-only for non-main)
-        # Only directory mounts are supported, not file mounts
         global_dir = GROUPS_DIR / "global"
         if global_dir.exists():
             mounts.append(
@@ -195,7 +170,6 @@ def build_volume_mounts(
             )
 
     # Per-group Claude sessions directory (isolated from other groups)
-    # Each group gets their own .claude/ to prevent cross-group session access
     group_sessions_dir = DATA_DIR / "sessions" / group.folder / ".claude"
     group_sessions_dir.mkdir(parents=True, exist_ok=True)
     settings_file = group_sessions_dir / "settings.json"
@@ -204,11 +178,8 @@ def build_volume_mounts(
             json.dumps(
                 {
                     "env": {
-                        # Enable agent swarms (subagent orchestration)
                         "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
-                        # Load CLAUDE.md from additional mounted directories
                         "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD": "1",
-                        # Enable Claude's memory feature
                         "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "0",
                     },
                 },
@@ -236,23 +207,7 @@ def build_volume_mounts(
         )
     )
 
-    # Per-group IPC namespace: each group gets its own IPC directory
-    # This prevents cross-group privilege escalation via IPC
-    group_ipc_dir = resolve_group_ipc_path(group.folder)
-    (group_ipc_dir / "messages").mkdir(parents=True, exist_ok=True)
-    (group_ipc_dir / "tasks").mkdir(parents=True, exist_ok=True)
-    (group_ipc_dir / "input").mkdir(parents=True, exist_ok=True)
-    mounts.append(
-        VolumeMount(
-            host_path=str(group_ipc_dir),
-            container_path="/workspace/ipc",
-            readonly=False,
-        )
-    )
-
-    # Python agent-runner is baked into the container image (no per-group source mount needed).
-    # TS version mounted source for per-group customization + runtime compilation;
-    # Python runs directly from /app/agent_runner/ in the image.
+    # No IPC directory mount needed — all communication goes through NATS.
 
     # Additional mounts validated against external allowlist (tamper-proof from containers)
     if group.container_config and group.container_config.additional_mounts:
@@ -276,6 +231,7 @@ def build_volume_mounts(
 def build_container_args(
     mounts: list[VolumeMount],
     container_name: str,
+    job_id: str,
 ) -> list[str]:
     """Build the CLI arguments for the container runtime.
 
@@ -286,6 +242,11 @@ def build_container_args(
     # Pass host timezone so container's local time matches the user's
     args.extend(["-e", f"TZ={TIMEZONE}"])
 
+    # NATS connection for IPC
+    nats_url = NATS_URL.replace("localhost", CONTAINER_HOST_GATEWAY)
+    args.extend(["-e", f"NATS_URL={nats_url}"])
+    args.extend(["-e", f"JOB_ID={job_id}"])
+
     # Route API traffic through the credential proxy (containers never see real secrets)
     args.extend(
         [
@@ -295,9 +256,6 @@ def build_container_args(
     )
 
     # Mirror the host's auth method with a placeholder value.
-    # API key mode: SDK sends x-api-key, proxy replaces with real key.
-    # OAuth mode:   SDK exchanges placeholder token for temp API key,
-    #               proxy injects real OAuth token on that exchange request.
     auth_mode = detect_auth_mode()
     if auth_mode == "api-key":
         args.extend(["-e", "ANTHROPIC_API_KEY=placeholder"])
@@ -308,8 +266,6 @@ def build_container_args(
     args.extend(host_gateway_args())
 
     # Run as host user so bind-mounted files are accessible.
-    # Skip when running as root (uid 0), as the container's node user (uid 1000),
-    # or when getuid is unavailable.
     host_uid: int | None = None
     host_gid: int | None = None
     if hasattr(os, "getuid"):
@@ -336,11 +292,14 @@ async def run_container_agent(
     inp: ContainerInput,
     on_process: Callable[[asyncio.subprocess.Process, str], None],
     on_output: Callable[[ContainerOutput], Awaitable[None]] | None = None,
+    transport: NatsTransport | None = None,
 ) -> ContainerOutput:
-    """Run the agent inside a container and return the parsed output.
+    """Run the agent inside a container with NATS-based IPC.
 
-    Streams stdout looking for OUTPUT_START_MARKER/OUTPUT_END_MARKER pairs.
-    Resets the timeout on each streamed output marker.
+    Channel 1: Writes initial input to KV before starting container.
+    Channel 2: Subscribes to JetStream for streaming results.
+    Channel 6: Writes snapshots to KV before starting container.
+    Stderr is still read for logging purposes.
     """
     start_time = time.monotonic()
     start_epoch_ms = int(time.time() * 1000)
@@ -348,15 +307,18 @@ async def run_container_agent(
     group_dir = resolve_group_folder_path(group.folder)
     group_dir.mkdir(parents=True, exist_ok=True)
 
+    job_id = f"{group.folder}-{uuid.uuid4().hex[:12]}"
+
     mounts = build_volume_mounts(group, inp.is_main)
     safe_name = re.sub(r"[^a-zA-Z0-9-]", "-", group.folder)
     container_name = f"nanoclaw-{safe_name}-{start_epoch_ms}"
-    container_args = build_container_args(mounts, container_name)
+    container_args = build_container_args(mounts, container_name, job_id)
 
     logger.debug(
         "Container mount configuration",
         group=group.name,
         container_name=container_name,
+        job_id=job_id,
         mounts=[f"{m.host_path} -> {m.container_path}{' (ro)' if m.readonly else ''}" for m in mounts],
         container_args=" ".join(container_args),
     )
@@ -365,6 +327,7 @@ async def run_container_agent(
         "Spawning container agent",
         group=group.name,
         container_name=container_name,
+        job_id=job_id,
         mount_count=len(mounts),
         is_main=inp.is_main,
     )
@@ -372,29 +335,36 @@ async def run_container_agent(
     logs_dir = group_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
 
+    # Channel 1: Write initial input to KV before starting container
+    if transport is not None:
+        kv_init = await transport.js.key_value("agent-init")
+        init_data = json.dumps(
+            {
+                "prompt": inp.prompt,
+                "group_folder": inp.group_folder,
+                "chat_jid": inp.chat_jid,
+                "is_main": inp.is_main,
+                "session_id": inp.session_id,
+                "is_scheduled_task": inp.is_scheduled_task,
+                "assistant_name": inp.assistant_name,
+            }
+        ).encode()
+        await kv_init.put(job_id, init_data)
+
     proc = await asyncio.create_subprocess_exec(
         CONTAINER_RUNTIME_BIN,
         *container_args,
-        stdin=asyncio.subprocess.PIPE,
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
 
     on_process(proc, container_name)
 
-    # Write input to container stdin
-    input_payload = json.dumps(_serialize_container_input(inp)).encode("utf-8")
-    assert proc.stdin is not None
-    proc.stdin.write(input_payload)
-    proc.stdin.close()
-
-    stdout_buf = ""
     stderr_buf = ""
-    stdout_truncated = False
     stderr_truncated = False
 
     # Streaming output state
-    parse_buffer = ""
     new_session_id: str | None = None
     had_streaming_output = False
     timed_out = False
@@ -402,8 +372,6 @@ async def run_container_agent(
     config_timeout = (
         group.container_config.timeout if group.container_config else CONTAINER_TIMEOUT
     ) or CONTAINER_TIMEOUT
-    # Grace period: hard timeout must be at least IDLE_TIMEOUT + 30s so the
-    # graceful _close sentinel has time to trigger before the hard kill fires.
     timeout_ms = max(config_timeout, IDLE_TIMEOUT + 30_000)
     timeout_s = timeout_ms / 1000.0
 
@@ -425,7 +393,6 @@ async def run_container_agent(
                     group=group.name,
                     container_name=container_name,
                 )
-                # Attempt graceful stop
                 try:
                     stop_proc = await asyncio.create_subprocess_exec(
                         *stop_container(container_name).split(),
@@ -447,61 +414,33 @@ async def run_container_agent(
 
     timeout_task = asyncio.create_task(_timeout_watcher())
 
-    async def _read_stdout() -> None:
-        nonlocal stdout_buf, stdout_truncated, parse_buffer
+    # Channel 2: Subscribe to JetStream for streaming results
+    results_sub = None
+    if transport is not None and on_output is not None:
+        results_sub = await transport.js.subscribe(f"agent.{job_id}.results")
+
+    async def _read_results() -> None:
         nonlocal new_session_id, had_streaming_output
-        assert proc.stdout is not None
-        while True:
-            chunk_bytes = await proc.stdout.read(8192)
-            if not chunk_bytes:
-                break
-            chunk = chunk_bytes.decode("utf-8", errors="replace")
-
-            # Accumulate for logging
-            if not stdout_truncated:
-                remaining = CONTAINER_MAX_OUTPUT_SIZE - len(stdout_buf)
-                if len(chunk) > remaining:
-                    stdout_buf += chunk[:remaining]
-                    stdout_truncated = True
-                    logger.warning(
-                        "Container stdout truncated due to size limit",
-                        group=group.name,
-                        size=len(stdout_buf),
-                    )
-                else:
-                    stdout_buf += chunk
-
-            # Stream-parse for output markers
-            if on_output is not None:
-                parse_buffer += chunk
-                while True:
-                    start_idx = parse_buffer.find(OUTPUT_START_MARKER)
-                    if start_idx == -1:
-                        break
-                    end_idx = parse_buffer.find(OUTPUT_END_MARKER, start_idx)
-                    if end_idx == -1:
-                        break  # Incomplete pair, wait for more data
-
-                    json_str = parse_buffer[start_idx + len(OUTPUT_START_MARKER) : end_idx].strip()
-                    parse_buffer = parse_buffer[end_idx + len(OUTPUT_END_MARKER) :]
-
-                    try:
-                        raw = json.loads(json_str)
-                        parsed = _parse_container_output(raw)
-                        if parsed.new_session_id:
-                            new_session_id = parsed.new_session_id
-                        had_streaming_output = True
-                        # Activity detected - reset the hard timeout
-                        activity_event.set()
-                        # Call on_output for all markers (including null results)
-                        # so idle timers start even for "silent" query completions.
-                        await on_output(parsed)
-                    except (json.JSONDecodeError, KeyError, TypeError) as err:
-                        logger.warning(
-                            "Failed to parse streamed output chunk",
-                            group=group.name,
-                            error=str(err),
-                        )
+        if results_sub is None:
+            return
+        async for msg in results_sub.messages:
+            try:
+                raw = json.loads(msg.data)
+                parsed = _parse_container_output(raw)
+                if parsed.new_session_id:
+                    new_session_id = parsed.new_session_id
+                had_streaming_output = True
+                activity_event.set()
+                if on_output is not None:
+                    await on_output(parsed)
+                await msg.ack()
+            except (json.JSONDecodeError, KeyError, TypeError) as err:
+                logger.warning(
+                    "Failed to parse streamed output",
+                    group=group.name,
+                    error=str(err),
+                )
+                await msg.ack()
 
     async def _read_stderr() -> None:
         nonlocal stderr_buf, stderr_truncated
@@ -515,8 +454,6 @@ async def run_container_agent(
             for line in lines:
                 if line:
                     logger.debug(line, container=group.folder)
-            # Don't reset timeout on stderr - SDK writes debug logs continuously.
-            # Timeout only resets on actual output (OUTPUT_MARKER in stdout).
             if stderr_truncated:
                 continue
             remaining = CONTAINER_MAX_OUTPUT_SIZE - len(stderr_buf)
@@ -531,11 +468,21 @@ async def run_container_agent(
             else:
                 stderr_buf += chunk
 
-    # Run stdout/stderr readers concurrently
-    await asyncio.gather(_read_stdout(), _read_stderr())
+    # Run readers concurrently
+    tasks: list[asyncio.Task[None]] = [asyncio.create_task(_read_stderr())]
+    if results_sub is not None:
+        tasks.append(asyncio.create_task(_read_results()))
 
     # Wait for process to exit
     code = await proc.wait()
+
+    # Cancel the results subscription and readers
+    if results_sub is not None:
+        await results_sub.unsubscribe()
+    for t in tasks:
+        t.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await t
 
     # Cancel the timeout watcher
     timeout_task.cancel()
@@ -554,6 +501,7 @@ async def run_container_agent(
                     f"Timestamp: {datetime.now(UTC).isoformat()}",
                     f"Group: {group.name}",
                     f"Container: {container_name}",
+                    f"Job ID: {job_id}",
                     f"Duration: {duration_ms}ms",
                     f"Exit Code: {code}",
                     f"Had Streaming Output: {had_streaming_output}",
@@ -562,9 +510,6 @@ async def run_container_agent(
             encoding="utf-8",
         )
 
-        # Timeout after output = idle cleanup, not failure.
-        # The agent already sent its response; this is just the
-        # container being reaped after the idle period expired.
         if had_streaming_output:
             logger.info(
                 "Container timed out after output (idle cleanup)",
@@ -601,9 +546,9 @@ async def run_container_agent(
         f"Timestamp: {datetime.now(UTC).isoformat()}",
         f"Group: {group.name}",
         f"IsMain: {inp.is_main}",
+        f"Job ID: {job_id}",
         f"Duration: {duration_ms}ms",
         f"Exit Code: {code}",
-        f"Stdout Truncated: {stdout_truncated}",
         f"Stderr Truncated: {stderr_truncated}",
         "",
     ]
@@ -611,14 +556,13 @@ async def run_container_agent(
     is_error = code != 0
 
     if is_verbose or is_error:
-        # On error, log input metadata only - not the full prompt.
-        # Full input is only included at verbose level to avoid
-        # persisting user conversation content on every non-zero exit.
         if is_verbose:
             log_lines.extend(
                 [
-                    "=== Input ===",
-                    json.dumps(_serialize_container_input(inp), indent=2),
+                    "=== Input Summary ===",
+                    f"Prompt length: {len(inp.prompt)} chars",
+                    f"Session ID: {inp.session_id or 'new'}",
+                    f"Job ID: {job_id}",
                     "",
                 ]
             )
@@ -641,9 +585,6 @@ async def run_container_agent(
                 "",
                 f"=== Stderr{' (TRUNCATED)' if stderr_truncated else ''} ===",
                 stderr_buf,
-                "",
-                f"=== Stdout{' (TRUNCATED)' if stdout_truncated else ''} ===",
-                stdout_buf,
             ]
         )
     else:
@@ -669,7 +610,6 @@ async def run_container_agent(
             code=code,
             duration=duration_ms,
             stderr=stderr_buf,
-            stdout=stdout_buf,
             log_file=str(log_file),
         )
         return ContainerOutput(
@@ -679,94 +619,47 @@ async def run_container_agent(
         )
 
     # Streaming mode: return completion marker
-    if on_output is not None:
-        logger.info(
-            "Container completed (streaming mode)",
-            group=group.name,
-            duration=duration_ms,
-            new_session_id=new_session_id,
-        )
-        return ContainerOutput(
-            status="success",
-            result=None,
-            new_session_id=new_session_id,
-        )
-
-    # Legacy mode: parse the last output marker pair from accumulated stdout
-    try:
-        # Extract JSON between sentinel markers for robust parsing
-        start_idx = stdout_buf.find(OUTPUT_START_MARKER)
-        end_idx = stdout_buf.find(OUTPUT_END_MARKER)
-
-        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-            json_line = stdout_buf[start_idx + len(OUTPUT_START_MARKER) : end_idx].strip()
-        else:
-            # Fallback: last non-empty line (backwards compatibility)
-            lines = stdout_buf.strip().split("\n")
-            json_line = lines[-1]
-
-        raw = json.loads(json_line)
-        output = _parse_container_output(raw)
-
-        logger.info(
-            "Container completed",
-            group=group.name,
-            duration=duration_ms,
-            status=output.status,
-            has_result=output.result is not None,
-        )
-        return output
-
-    except (json.JSONDecodeError, KeyError, TypeError, IndexError) as err:
-        logger.error(
-            "Failed to parse container output",
-            group=group.name,
-            stdout=stdout_buf,
-            stderr=stderr_buf,
-            error=str(err),
-        )
-        return ContainerOutput(
-            status="error",
-            result=None,
-            error=f"Failed to parse container output: {err}",
-        )
+    logger.info(
+        "Container completed",
+        group=group.name,
+        duration=duration_ms,
+        new_session_id=new_session_id,
+    )
+    return ContainerOutput(
+        status="success",
+        result=None,
+        new_session_id=new_session_id,
+    )
 
 
-def write_tasks_snapshot(
+async def write_tasks_snapshot(
+    transport: NatsTransport,
     group_folder: str,
     is_main: bool,
     tasks: list[dict[str, object]],
 ) -> None:
-    """Write filtered tasks to the group's IPC directory.
+    """Write filtered tasks to NATS KV for the agent to read.
 
     Main sees all tasks, others only see their own.
     """
-    group_ipc_dir = resolve_group_ipc_path(group_folder)
-    group_ipc_dir.mkdir(parents=True, exist_ok=True)
-
-    # Main sees all tasks, others only see their own
     filtered_tasks: list[dict[str, object]]
     filtered_tasks = tasks if is_main else [t for t in tasks if t.get("groupFolder") == group_folder]
 
-    tasks_file = group_ipc_dir / "current_tasks.json"
-    tasks_file.write_text(json.dumps(filtered_tasks, indent=2), encoding="utf-8")
+    kv = await transport.js.key_value("snapshots")
+    await kv.put(f"{group_folder}.tasks", json.dumps(filtered_tasks).encode())
 
 
-def write_groups_snapshot(
+async def write_groups_snapshot(
+    transport: NatsTransport,
     group_folder: str,
     is_main: bool,
     groups: list[AvailableGroup],
     _registered_jids: set[str],
 ) -> None:
-    """Write available groups snapshot for the container to read.
+    """Write available groups snapshot to NATS KV for the agent to read.
 
     Only main group can see all available groups (for activation).
-    Non-main groups only see their own registration status.
     """
-    group_ipc_dir = resolve_group_ipc_path(group_folder)
-    group_ipc_dir.mkdir(parents=True, exist_ok=True)
-
-    # Main sees all groups; others see nothing (they can't activate groups)
     visible_groups: list[dict[str, object]]
     if is_main:
         visible_groups = [
@@ -781,14 +674,13 @@ def write_groups_snapshot(
     else:
         visible_groups = []
 
-    groups_file = group_ipc_dir / "available_groups.json"
-    groups_file.write_text(
+    kv = await transport.js.key_value("snapshots")
+    await kv.put(
+        f"{group_folder}.groups",
         json.dumps(
             {
                 "groups": visible_groups,
                 "lastSync": datetime.now(UTC).isoformat(),
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
+            }
+        ).encode(),
     )

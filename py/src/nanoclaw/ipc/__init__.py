@@ -1,5 +1,7 @@
-"""IPC layer — file-based transport."""
+"""IPC layer -- NATS-based messaging between Orchestrator and Agent."""
 
-from nanoclaw.ipc.file_transport import start_ipc_watcher
+from nanoclaw.ipc.nats_transport import NatsTransport
+from nanoclaw.ipc.protocol import AgentInitData, IpcEnvelope
+from nanoclaw.ipc.task_handler import IpcDeps, process_task_ipc
 
-__all__ = ["start_ipc_watcher"]
+__all__ = ["AgentInitData", "IpcDeps", "IpcEnvelope", "NatsTransport", "process_task_ipc"]

@@ -17,7 +17,6 @@ ASSISTANT_HAS_OWN_NUMBER: bool = (
 
 POLL_INTERVAL: float = 2.0  # seconds
 SCHEDULER_POLL_INTERVAL: float = 60.0  # seconds
-IPC_POLL_INTERVAL: float = 1.0  # seconds
 
 PROJECT_ROOT: Path = Path.cwd()
 HOME_DIR: Path = Path.home()
@@ -27,6 +26,8 @@ SENDER_ALLOWLIST_PATH: Path = HOME_DIR / ".config" / "nanoclaw" / "sender-allowl
 STORE_DIR: Path = PROJECT_ROOT / "store"
 GROUPS_DIR: Path = PROJECT_ROOT / "groups"
 DATA_DIR: Path = PROJECT_ROOT / "data"
+
+NATS_URL: str = os.environ.get("NATS_URL", "nats://localhost:4222")
 
 CONTAINER_IMAGE: str = os.environ.get("CONTAINER_IMAGE", "nanoclaw-agent:latest")
 CONTAINER_TIMEOUT: int = int(os.environ.get("CONTAINER_TIMEOUT", "1800000"))
