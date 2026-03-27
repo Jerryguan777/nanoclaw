@@ -94,6 +94,7 @@ class SchedulerDependencies(Protocol):
         proc: object,
         container_name: str,
         group_folder: str,
+        job_id: str | None = None,
     ) -> None: ...
     def send_message(self, jid: str, text: str) -> Awaitable[None]: ...
     @property
@@ -219,7 +220,9 @@ async def _run_task(
                 is_scheduled_task=True,
                 assistant_name=ASSISTANT_NAME,
             ),
-            lambda proc, container_name: deps.on_process(task.chat_jid, proc, container_name, task.group_folder),
+            lambda proc, container_name, job_id: deps.on_process(
+                task.chat_jid, proc, container_name, task.group_folder, job_id
+            ),
             _on_output,
             transport=transport,
         )

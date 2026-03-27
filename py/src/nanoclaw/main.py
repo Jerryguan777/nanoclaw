@@ -428,7 +428,9 @@ async def _run_agent(
                 is_main=is_main,
                 assistant_name=ASSISTANT_NAME,
             ),
-            lambda proc, container_name: _queue.register_process(chat_jid, proc, container_name, group.folder),
+            lambda proc, container_name, job_id: _queue.register_process(
+                chat_jid, proc, container_name, group.folder, job_id
+            ),
             wrapped_on_output,
             transport=_transport,
         )
@@ -738,8 +740,9 @@ class _SchedulerDepsImpl:
         proc: object,
         container_name: str,
         group_folder: str,
+        job_id: str | None = None,
     ) -> None:
-        _queue.register_process(group_jid, proc, container_name, group_folder)
+        _queue.register_process(group_jid, proc, container_name, group_folder, job_id)
 
     @property
     def transport(self) -> NatsTransport | None:

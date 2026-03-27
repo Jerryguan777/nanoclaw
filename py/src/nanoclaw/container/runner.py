@@ -290,7 +290,7 @@ def build_container_args(
 async def run_container_agent(
     group: RegisteredGroup,
     inp: ContainerInput,
-    on_process: Callable[[asyncio.subprocess.Process, str], None],
+    on_process: Callable[[asyncio.subprocess.Process, str, str], None],
     on_output: Callable[[ContainerOutput], Awaitable[None]] | None = None,
     transport: NatsTransport | None = None,
 ) -> ContainerOutput:
@@ -359,7 +359,7 @@ async def run_container_agent(
         stderr=asyncio.subprocess.PIPE,
     )
 
-    on_process(proc, container_name)
+    on_process(proc, container_name, job_id)
 
     stderr_buf = ""
     stderr_truncated = False

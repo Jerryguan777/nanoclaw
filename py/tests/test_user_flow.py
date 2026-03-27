@@ -190,7 +190,7 @@ def make_agent_mock(
         transport: object | None = None,
     ) -> ContainerOutput:
         captured.append(inp)
-        on_process(object(), "mock-container")
+        on_process(object(), "mock-container", "test-job")
 
         output = ContainerOutput(
             status="success",
@@ -642,7 +642,7 @@ class TestScenarioErrorRecovery:
             on_output: Callable[..., Awaitable[None]] | None = None,
             transport: object | None = None,
         ) -> ContainerOutput:
-            on_process(object(), "crash-container")
+            on_process(object(), "crash-container", "test-job")
             if on_output:
                 await on_output(ContainerOutput(status="error", result=None, error="Segfault"))
             return ContainerOutput(status="error", result=None, error="Segfault")
@@ -673,7 +673,7 @@ class TestScenarioErrorRecovery:
             on_output: Callable[..., Awaitable[None]] | None = None,
             transport: object | None = None,
         ) -> ContainerOutput:
-            on_process(object(), "partial-container")
+            on_process(object(), "partial-container", "test-job")
             if on_output:
                 # First: send a successful partial output
                 await on_output(

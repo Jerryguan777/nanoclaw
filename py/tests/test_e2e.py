@@ -115,7 +115,7 @@ def make_container_mock(
         transport: object | None = None,
     ) -> ContainerOutput:
         captured_inputs.append(inp)
-        on_process(object(), "test-container-mock")
+        on_process(object(), "test-container-mock", "test-job")
 
         output = ContainerOutput(
             status=status,  # type: ignore[arg-type]
@@ -372,7 +372,7 @@ async def test_format_messages_xml(e2e_env: Path) -> None:
         transport: object | None = None,
     ) -> ContainerOutput:
         captured_prompts.append(inp.prompt)
-        on_process(object(), "test-container")
+        on_process(object(), "test-container", "test-job")
         if on_output:
             await on_output(ContainerOutput(status="success", result="OK"))
         return ContainerOutput(status="success", result=None)
