@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import nats
-from nats.js.api import KeyValueConfig, RetentionPolicy, StreamConfig
+from nats.js.api import KeyValueConfig, StreamConfig
 
 from nanoclaw.core.logger import get_logger
 
@@ -59,12 +59,14 @@ class NatsTransport:
             ) from exc
         self._js = self._nc.jetstream()
 
-        # Create JetStream stream for agent communication
+        # Create JetStream stream for agent communication.
+        # Uses LIMITS retention (default) — WorkQueue doesn't allow multiple
+        # consumers with overlapping subject filters, which we need since both
+        # orchestrator and agent subscribe to different subjects in this stream.
         await self._js.add_stream(
             StreamConfig(
                 name="agent-ipc",
                 subjects=["agent.*.results", "agent.*.input", "agent.*.messages", "agent.*.tasks"],
-                retention=RetentionPolicy.WORK_QUEUE,
                 max_age=_STREAM_MAX_AGE_S,
             )
         )
