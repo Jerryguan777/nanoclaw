@@ -7,31 +7,11 @@ from dataclasses import asdict, dataclass
 
 
 @dataclass(frozen=True)
-class IpcEnvelope:
-    """Wrapper for all IPC messages sent over NATS JetStream."""
-
-    type: str
-    group_folder: str
-    timestamp: str
-    payload: dict[str, object]
-
-    def serialize(self) -> bytes:
-        return json.dumps(asdict(self)).encode()
-
-    @classmethod
-    def deserialize(cls, data: bytes) -> IpcEnvelope:
-        raw = json.loads(data)
-        return cls(
-            type=raw["type"],
-            group_folder=raw["group_folder"],
-            timestamp=raw["timestamp"],
-            payload=raw["payload"],
-        )
-
-
-@dataclass(frozen=True)
 class AgentInitData:
-    """Channel 1: initial input written to KV before container starts."""
+    """Channel 1: initial input written to KV before container starts.
+
+    Shared between orchestrator (serialize) and agent runner (deserialize).
+    """
 
     prompt: str
     group_folder: str

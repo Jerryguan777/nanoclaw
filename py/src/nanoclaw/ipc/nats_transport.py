@@ -42,6 +42,7 @@ class NatsTransport:
 
         Raises ConnectionError if NATS is unreachable.
         """
+
         async def _quiet_error(exc: Exception) -> None:
             logger.debug("NATS connection attempt failed", error=str(exc))
 

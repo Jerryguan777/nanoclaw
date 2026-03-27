@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any
 
 import nats
 from claude_agent_sdk import ClaudeAgentOptions, HookMatcher, query
+from nanoclaw_ipc_protocol import AgentInitData
 
 from .ipc_mcp import create_nanoclaw_mcp_server
 
@@ -570,15 +571,15 @@ async def main() -> None:
     try:
         kv = await js.key_value("agent-init")
         entry = await kv.get(JOB_ID)
-        raw = json.loads(entry.value)
+        init = AgentInitData.deserialize(entry.value)
         container_input = ContainerInput(
-            prompt=raw["prompt"],
-            group_folder=raw["group_folder"],
-            chat_jid=raw["chat_jid"],
-            is_main=raw["is_main"],
-            session_id=raw.get("session_id"),
-            is_scheduled_task=raw.get("is_scheduled_task", False),
-            assistant_name=raw.get("assistant_name"),
+            prompt=init.prompt,
+            group_folder=init.group_folder,
+            chat_jid=init.chat_jid,
+            is_main=init.is_main,
+            session_id=init.session_id,
+            is_scheduled_task=init.is_scheduled_task,
+            assistant_name=init.assistant_name,
         )
         log(f"Received input for group: {container_input.group_folder}")
     except (OSError, json.JSONDecodeError, KeyError, ValueError, RuntimeError) as exc:

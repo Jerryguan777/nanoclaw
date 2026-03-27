@@ -39,6 +39,7 @@ from nanoclaw.core.config import (
 )
 from nanoclaw.core.group_folder import resolve_group_folder_path
 from nanoclaw.core.logger import get_logger
+from nanoclaw.ipc.protocol import AgentInitData
 from nanoclaw.security.credential_proxy import detect_auth_mode
 from nanoclaw.security.mount_security import validate_additional_mounts
 
@@ -338,24 +339,22 @@ async def run_container_agent(
     # Channel 1: Write initial input to KV before starting container
     if transport is not None:
         kv_init = await transport.js.key_value("agent-init")
-        init_data = json.dumps(
-            {
-                "prompt": inp.prompt,
-                "group_folder": inp.group_folder,
-                "chat_jid": inp.chat_jid,
-                "is_main": inp.is_main,
-                "session_id": inp.session_id,
-                "is_scheduled_task": inp.is_scheduled_task,
-                "assistant_name": inp.assistant_name,
-            }
-        ).encode()
-        await kv_init.put(job_id, init_data)
+        agent_init = AgentInitData(
+            prompt=inp.prompt,
+            group_folder=inp.group_folder,
+            chat_jid=inp.chat_jid,
+            is_main=inp.is_main,
+            session_id=inp.session_id,
+            is_scheduled_task=inp.is_scheduled_task,
+            assistant_name=inp.assistant_name,
+        )
+        await kv_init.put(job_id, agent_init.serialize())
 
     proc = await asyncio.create_subprocess_exec(
         CONTAINER_RUNTIME_BIN,
         *container_args,
         stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
     )
 

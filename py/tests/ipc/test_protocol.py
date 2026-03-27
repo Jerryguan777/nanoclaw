@@ -2,23 +2,7 @@
 
 from __future__ import annotations
 
-from nanoclaw.ipc.protocol import AgentInitData, IpcEnvelope
-
-
-def test_ipc_envelope_roundtrip() -> None:
-    """IpcEnvelope serializes and deserializes correctly."""
-    envelope = IpcEnvelope(
-        type="message",
-        group_folder="testgroup",
-        timestamp="2024-06-01T12:00:00Z",
-        payload={"text": "hello", "chatJid": "chat@test"},
-    )
-    data = envelope.serialize()
-    restored = IpcEnvelope.deserialize(data)
-    assert restored.type == envelope.type
-    assert restored.group_folder == envelope.group_folder
-    assert restored.timestamp == envelope.timestamp
-    assert restored.payload == envelope.payload
+from nanoclaw.ipc.protocol import AgentInitData
 
 
 def test_agent_init_data_roundtrip() -> None:
@@ -56,21 +40,6 @@ def test_agent_init_data_optional_fields() -> None:
     assert restored.session_id is None
     assert restored.is_scheduled_task is False
     assert restored.assistant_name is None
-
-
-def test_ipc_envelope_frozen() -> None:
-    """IpcEnvelope is immutable."""
-    envelope = IpcEnvelope(
-        type="test",
-        group_folder="g",
-        timestamp="t",
-        payload={},
-    )
-    try:
-        envelope.type = "other"  # type: ignore[misc]
-        raise AssertionError("Should have raised")
-    except AttributeError:
-        pass
 
 
 def test_agent_init_data_frozen() -> None:
