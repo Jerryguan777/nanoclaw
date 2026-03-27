@@ -38,8 +38,25 @@ class NatsTransport:
         self._js: JetStreamContext | None = None
 
     async def connect(self) -> None:
-        """Connect to NATS and create JetStream stream + KV buckets."""
-        self._nc = await nats.connect(self._url)
+        """Connect to NATS and create JetStream stream + KV buckets.
+
+        Raises ConnectionError if NATS is unreachable.
+        """
+        async def _quiet_error(exc: Exception) -> None:
+            logger.debug("NATS connection attempt failed", error=str(exc))
+
+        try:
+            self._nc = await nats.connect(
+                self._url,
+                max_reconnect_attempts=3,
+                reconnect_time_wait=1,
+                error_cb=_quiet_error,
+            )
+        except Exception as exc:
+            raise ConnectionError(
+                f"Cannot connect to NATS at {self._url}. "
+                f"Start NATS with: docker compose -f docker-compose.dev.yml up -d"
+            ) from exc
         self._js = self._nc.jetstream()
 
         # Create JetStream stream for agent communication

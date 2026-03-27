@@ -605,7 +605,15 @@ async def main() -> None:
 
     # Connect to NATS for IPC
     _transport = NatsTransport(NATS_URL)
-    await _transport.connect()
+    try:
+        await _transport.connect()
+    except ConnectionError:
+        logger.critical(
+            "Failed to connect to NATS — is it running?",
+            url=NATS_URL,
+            hint="docker compose -f docker-compose.dev.yml up -d",
+        )
+        sys.exit(1)
 
     # Create queue with transport
     _queue = GroupQueue(transport=_transport)
