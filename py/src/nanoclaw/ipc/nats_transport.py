@@ -19,11 +19,11 @@ if TYPE_CHECKING:
 
 logger = get_logger()
 
-# Stream TTL: 1 hour in nanoseconds
-_STREAM_MAX_AGE_NS = 3_600_000_000_000
+# Stream max age: 1 hour in seconds (nats-py converts to nanoseconds internally)
+_STREAM_MAX_AGE_S = 3600.0
 
 # KV TTL: 1 hour in seconds
-_KV_TTL_SECONDS = 3600
+_KV_TTL_SECONDS = 3600.0
 
 
 class NatsTransport:
@@ -46,9 +46,9 @@ class NatsTransport:
         await self._js.add_stream(
             StreamConfig(
                 name="agent-ipc",
-                subjects=["agent.>"],
+                subjects=["agent.*.results", "agent.*.input", "agent.*.messages", "agent.*.tasks"],
                 retention=RetentionPolicy.WORK_QUEUE,
-                max_age=_STREAM_MAX_AGE_NS,
+                max_age=_STREAM_MAX_AGE_S,
             )
         )
 
