@@ -275,5 +275,14 @@ def create_nanoclaw_mcp_server(
 
     return create_sdk_mcp_server(
         "nanoclaw",
-        tools=[send_message, schedule_task, list_tasks, pause_task, resume_task, cancel_task, update_task, register_group],
+        tools=[
+            send_message,
+            schedule_task,
+            list_tasks,
+            pause_task,
+            resume_task,
+            cancel_task,
+            update_task,
+            register_group,
+        ],
     )
