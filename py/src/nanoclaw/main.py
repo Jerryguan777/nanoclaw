@@ -35,7 +35,8 @@ from nanoclaw.core.config import (
 )
 from nanoclaw.core.group_folder import resolve_group_folder_path
 from nanoclaw.core.logger import get_logger
-from nanoclaw.db.sqlite import (
+from nanoclaw.db.pg import (
+    close_database,
     get_all_chats,
     get_all_registered_groups,
     get_all_sessions,
@@ -99,26 +100,26 @@ _bg_tasks: set[asyncio.Task[None]] = set()
 # ---------------------------------------------------------------------------
 
 
-def _load_state() -> None:
+async def _load_state() -> None:
     """Load persisted state from the database."""
     global _last_timestamp, _sessions, _registered_groups, _last_agent_timestamp
 
-    _last_timestamp = get_router_state("last_timestamp") or ""
-    agent_ts = get_router_state("last_agent_timestamp")
+    _last_timestamp = await get_router_state("last_timestamp") or ""
+    agent_ts = await get_router_state("last_agent_timestamp")
     try:
         _last_agent_timestamp = json.loads(agent_ts) if agent_ts else {}
     except (json.JSONDecodeError, TypeError):
         logger.warning("Corrupted last_agent_timestamp in DB, resetting")
         _last_agent_timestamp = {}
-    _sessions = get_all_sessions()
-    _registered_groups = get_all_registered_groups()
+    _sessions = await get_all_sessions()
+    _registered_groups = await get_all_registered_groups()
     logger.info("State loaded", group_count=len(_registered_groups))
 
 
-def _save_state() -> None:
+async def _save_state() -> None:
     """Persist state to the database."""
-    set_router_state("last_timestamp", _last_timestamp)
-    set_router_state("last_agent_timestamp", json.dumps(_last_agent_timestamp))
+    await set_router_state("last_timestamp", _last_timestamp)
+    await set_router_state("last_agent_timestamp", json.dumps(_last_agent_timestamp))
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +127,7 @@ def _save_state() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _register_group(jid: str, group: RegisteredGroup) -> None:
+async def _register_group(jid: str, group: RegisteredGroup) -> None:
     """Register a new group and persist it."""
     try:
         group_dir = resolve_group_folder_path(group.folder)
@@ -135,16 +136,16 @@ def _register_group(jid: str, group: RegisteredGroup) -> None:
         return
 
     _registered_groups[jid] = group
-    set_registered_group(jid, group)
+    await set_registered_group(jid, group)
 
     # Create group folder
     (group_dir / "logs").mkdir(parents=True, exist_ok=True)
     logger.info("Group registered", jid=jid, name=group.name, folder=group.folder)
 
 
-def get_available_groups() -> list[AvailableGroup]:
+async def get_available_groups() -> list[AvailableGroup]:
     """Get available groups list for the agent."""
-    chats = get_all_chats()
+    chats = await get_all_chats()
     registered_jids = set(_registered_groups.keys())
 
     return [
@@ -256,7 +257,7 @@ async def _process_group_messages(chat_jid: str) -> bool:
     is_main_group = group.is_main
 
     since_timestamp = _last_agent_timestamp.get(chat_jid, "")
-    missed_messages = get_messages_since(chat_jid, since_timestamp, ASSISTANT_NAME)
+    missed_messages = await get_messages_since(chat_jid, since_timestamp, ASSISTANT_NAME)
 
     if not missed_messages:
         return True
@@ -275,7 +276,7 @@ async def _process_group_messages(chat_jid: str) -> bool:
 
     previous_cursor = _last_agent_timestamp.get(chat_jid, "")
     _last_agent_timestamp[chat_jid] = missed_messages[-1].timestamp
-    _save_state()
+    await _save_state()
 
     logger.info("Processing messages", group=group.name, message_count=len(missed_messages))
 
@@ -333,7 +334,7 @@ async def _process_group_messages(chat_jid: str) -> bool:
             )
             return True
         _last_agent_timestamp[chat_jid] = previous_cursor
-        _save_state()
+        await _save_state()
         logger.warning("Agent error, rolled back message cursor for retry", group=group.name)
         return False
 
@@ -351,7 +352,7 @@ async def _run_agent(
     session_id = _sessions.get(group.folder)
 
     if _transport is not None:
-        tasks = get_all_tasks()
+        tasks = await get_all_tasks()
         await write_tasks_snapshot(
             _transport,
             group.folder,
@@ -370,7 +371,7 @@ async def _run_agent(
             ],
         )
 
-        available_groups = get_available_groups()
+        available_groups = await get_available_groups()
         await write_groups_snapshot(
             _transport,
             group.folder,
@@ -390,7 +391,7 @@ async def _run_agent(
         async def _wrapped(output: AgentOutput) -> None:
             if output.new_session_id:
                 _sessions[group.folder] = output.new_session_id
-                set_session(group.folder, output.new_session_id)
+                await set_session(group.folder, output.new_session_id)
             await original_on_output(output)
 
         wrapped_on_output = _wrapped
@@ -413,7 +414,7 @@ async def _run_agent(
 
         if output.new_session_id:
             _sessions[group.folder] = output.new_session_id
-            set_session(group.folder, output.new_session_id)
+            await set_session(group.folder, output.new_session_id)
 
         if output.status == "error":
             logger.error("Container agent error", group=group.name, error=output.error)
@@ -444,13 +445,13 @@ async def _message_loop(shutdown_event: asyncio.Event) -> None:
     while not shutdown_event.is_set():
         try:
             jids = list(_registered_groups.keys())
-            messages, new_timestamp = get_new_messages(jids, _last_timestamp, ASSISTANT_NAME)
+            messages, new_timestamp = await get_new_messages(jids, _last_timestamp, ASSISTANT_NAME)
 
             if messages:
                 logger.info("New messages", count=len(messages))
 
                 _last_timestamp = new_timestamp
-                _save_state()
+                await _save_state()
 
                 messages_by_group: dict[str, list[NewMessage]] = {}
                 for msg in messages:
@@ -479,7 +480,7 @@ async def _message_loop(shutdown_event: asyncio.Event) -> None:
                         if not has_trigger:
                             continue
 
-                    all_pending = get_messages_since(
+                    all_pending = await get_messages_since(
                         chat_jid,
                         _last_agent_timestamp.get(chat_jid, ""),
                         ASSISTANT_NAME,
@@ -492,7 +493,7 @@ async def _message_loop(shutdown_event: asyncio.Event) -> None:
                             "Piped messages to active container", chat_jid=chat_jid, count=len(messages_to_send)
                         )
                         _last_agent_timestamp[chat_jid] = messages_to_send[-1].timestamp
-                        _save_state()
+                        await _save_state()
                         if hasattr(channel, "set_typing"):
                             try:
                                 await channel.set_typing(chat_jid, True)
@@ -510,11 +511,11 @@ async def _message_loop(shutdown_event: asyncio.Event) -> None:
             pass
 
 
-def _recover_pending_messages() -> None:
+async def _recover_pending_messages() -> None:
     """Startup recovery: check for unprocessed messages in registered groups."""
     for chat_jid, group in _registered_groups.items():
         since_timestamp = _last_agent_timestamp.get(chat_jid, "")
-        pending = get_messages_since(chat_jid, since_timestamp, ASSISTANT_NAME)
+        pending = await get_messages_since(chat_jid, since_timestamp, ASSISTANT_NAME)
         if pending:
             logger.info("Recovery: found unprocessed messages", group=group.name, pending_count=len(pending))
             _queue.enqueue_message_check(chat_jid)
@@ -570,9 +571,9 @@ async def main() -> None:
     global _transport, _queue, _runtime, _executor
 
     await _ensure_container_system_running()
-    init_database()
+    await init_database()
     logger.info("Database initialized")
-    _load_state()
+    await _load_state()
     restore_remote_control()
 
     _transport = NatsTransport(NATS_URL)
@@ -634,7 +635,9 @@ async def main() -> None:
                     logger.debug("sender-allowlist: dropping message (drop mode)", chat_jid=chat_jid, sender=msg.sender)
                 return
 
-        store_message(msg)
+        asyncio.ensure_future(store_message(msg)).add_done_callback(
+            lambda fut: logger.error("store_message error", error=str(fut.exception())) if fut.exception() else None
+        )
 
     channel_opts = ChannelOpts(
         on_message=_on_message,
@@ -666,7 +669,7 @@ async def main() -> None:
     ipc_tasks = await _start_nats_ipc_subscriptions(_transport, ipc_deps)
 
     _queue.set_process_messages_fn(_process_group_messages)
-    _recover_pending_messages()
+    await _recover_pending_messages()
 
     await _message_loop(shutdown_event)
 
@@ -681,6 +684,7 @@ async def main() -> None:
         await ch.disconnect()
     await _transport.close()
     await _runtime.close()
+    await close_database()
 
 
 # ---------------------------------------------------------------------------
@@ -741,8 +745,8 @@ class _IpcDepsImpl:
     def registered_groups(self) -> dict[str, RegisteredGroup]:
         return _registered_groups
 
-    def register_group(self, jid: str, group: RegisteredGroup) -> None:
-        _register_group(jid, group)
+    async def register_group(self, jid: str, group: RegisteredGroup) -> None:
+        await _register_group(jid, group)
 
     async def sync_groups(self, force: bool) -> None:
         coros = []
@@ -752,8 +756,8 @@ class _IpcDepsImpl:
         if coros:
             await asyncio.gather(*coros)
 
-    def get_available_groups(self) -> list[AvailableGroup]:
-        return get_available_groups()
+    async def get_available_groups(self) -> list[AvailableGroup]:
+        return await get_available_groups()
 
     def write_groups_snapshot(
         self,
@@ -769,10 +773,10 @@ class _IpcDepsImpl:
             _bg_tasks.add(t)
             t.add_done_callback(_bg_tasks.discard)
 
-    def on_tasks_changed(self) -> None:
+    async def on_tasks_changed(self) -> None:
         if _transport is None:
             return
-        tasks = get_all_tasks()
+        tasks = await get_all_tasks()
         task_rows: list[dict[str, object]] = [
             {
                 "id": t.id,

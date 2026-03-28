@@ -1,7 +1,8 @@
-"""Data layer — SQLite persistence."""
+"""Data layer — PostgreSQL persistence."""
 
-from nanoclaw.db.sqlite import (
+from nanoclaw.db.pg import (
     ChatInfo,
+    close_database,
     create_task,
     delete_task,
     get_all_chats,
@@ -12,6 +13,7 @@ from nanoclaw.db.sqlite import (
     get_last_group_sync,
     get_messages_since,
     get_new_messages,
+    get_registered_group,
     get_router_state,
     get_session,
     get_task_by_id,
@@ -31,11 +33,12 @@ from nanoclaw.db.sqlite import (
 )
 
 # Test helper — only import when needed
-from nanoclaw.db.sqlite import _init_test_database as _init_test_database
+from nanoclaw.db.pg import _init_test_database as _init_test_database
 
 __all__ = [
     "ChatInfo",
     "_init_test_database",
+    "close_database",
     "create_task",
     "delete_task",
     "get_all_chats",
@@ -46,6 +49,7 @@ __all__ = [
     "get_last_group_sync",
     "get_messages_since",
     "get_new_messages",
+    "get_registered_group",
     "get_router_state",
     "get_session",
     "get_task_by_id",

@@ -63,13 +63,13 @@ class FakeChannel:
 
 
 # ---------------------------------------------------------------------------
-# Environment fixture — sets up isolated dirs and in-memory DB
+# Environment fixture — sets up isolated dirs and PG test DB
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture
-def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Isolated environment: tmp dirs, in-memory DB, fast polling."""
+async def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_url: str) -> Path:
+    """Isolated environment: tmp dirs, PG test DB, fast polling."""
     data_dir = tmp_path / "data"
     groups_dir = tmp_path / "groups"
     store_dir = tmp_path / "store"
@@ -100,10 +100,15 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         re.compile(r"^@Andy\b", re.IGNORECASE),
     )
 
-    from nanoclaw.db.sqlite import _init_test_database
+    from nanoclaw.db.pg import _init_test_database
 
-    _init_test_database()
-    return tmp_path
+    await _init_test_database(pg_url)
+
+    yield tmp_path
+
+    from nanoclaw.db.pg import close_database
+
+    await close_database()
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +116,7 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def register_group(
+async def register_group(
     channel: FakeChannel,
     jid: str = "tg_group_123@telegram",
     folder: str = "telegram_mygroup",
@@ -122,7 +127,7 @@ def register_group(
     """Register a group and wire up main.py module state."""
     import nanoclaw.main as m
     from nanoclaw.core.types import RegisteredGroup
-    from nanoclaw.db.sqlite import set_registered_group, store_chat_metadata
+    from nanoclaw.db.pg import set_registered_group, store_chat_metadata
 
     group = RegisteredGroup(
         name=name,
@@ -141,8 +146,8 @@ def register_group(
     m._queue = m.GroupQueue()
     m._queue.set_process_messages_fn(m._process_group_messages)
 
-    set_registered_group(jid, group)
-    store_chat_metadata(jid, "2024-01-01T00:00:00Z", name=name, is_group=True)
+    await set_registered_group(jid, group)
+    await store_chat_metadata(jid, "2024-01-01T00:00:00Z", name=name, is_group=True)
 
     if groups_dir:
         gdir = groups_dir / folder
@@ -150,7 +155,7 @@ def register_group(
         (gdir / "logs").mkdir(exist_ok=True)
 
 
-def send_user_message(
+async def send_user_message(
     jid: str,
     text: str,
     sender: str = "user_456",
@@ -159,9 +164,9 @@ def send_user_message(
 ) -> None:
     """Simulate a user sending a message through a channel."""
     from nanoclaw.core.types import NewMessage
-    from nanoclaw.db.sqlite import store_message
+    from nanoclaw.db.pg import store_message
 
-    store_message(
+    await store_message(
         NewMessage(
             id=f"msg-{id(text)}-{timestamp}",
             chat_jid=jid,
@@ -177,12 +182,7 @@ def make_agent_mock(
     response: str = "Hello! I'm Andy, your assistant.",
     session_id: str | None = "session-001",
 ) -> object:
-    """Mock agent executor that returns a canned response.
-
-    Returns an object satisfying the AgentExecutor protocol with a ``name``
-    property and an async ``execute`` method.  Also exposes a
-    ``captured_inputs`` list so tests can inspect what was passed in.
-    """
+    """Mock agent executor that returns a canned response."""
     from nanoclaw.agent.executor import AgentInput, AgentOutput
 
     class _FakeHandle:
@@ -231,10 +231,9 @@ class TestScenarioFirstTimeUser:
 
     async def test_database_init_and_state_load(self, env: Path) -> None:
         """Step 1: DB initializes, state loads (0 groups)."""
-        from nanoclaw.db.sqlite import get_all_registered_groups, init_database
+        from nanoclaw.db.pg import get_all_registered_groups
 
-        init_database()
-        groups = get_all_registered_groups()
+        groups = await get_all_registered_groups()
         # We already registered one in fixture, but this verifies DB works
         assert isinstance(groups, dict)
 
@@ -242,10 +241,10 @@ class TestScenarioFirstTimeUser:
         """Step 2: User sends first message → agent is invoked → response sent back."""
         jid = "tg_group_123@telegram"
         channel = FakeChannel(owned_jids=[jid])
-        register_group(channel, jid=jid, groups_dir=env / "groups")
+        await register_group(channel, jid=jid, groups_dir=env / "groups")
 
         # User sends a message
-        send_user_message(jid, "Hello Andy, can you help me?")
+        await send_user_message(jid, "Hello Andy, can you help me?")
 
         # Mock the container agent
         mock = make_agent_mock(response="Of course! What do you need help with?")
@@ -268,9 +267,9 @@ class TestScenarioFirstTimeUser:
         """Step 3: Session ID returned by agent is persisted for next call."""
         jid = "tg_group_123@telegram"
         channel = FakeChannel(owned_jids=[jid])
-        register_group(channel, jid=jid, groups_dir=env / "groups")
+        await register_group(channel, jid=jid, groups_dir=env / "groups")
 
-        send_user_message(jid, "Remember this context")
+        await send_user_message(jid, "Remember this context")
         mock = make_agent_mock(response="Noted!", session_id="sess-abc-123")
 
         import nanoclaw.main as m
@@ -280,9 +279,9 @@ class TestScenarioFirstTimeUser:
 
         assert m._sessions.get("telegram_mygroup") == "sess-abc-123"
 
-        from nanoclaw.db.sqlite import get_session
+        from nanoclaw.db.pg import get_session
 
-        assert get_session("telegram_mygroup") == "sess-abc-123"
+        assert await get_session("telegram_mygroup") == "sess-abc-123"
 
 
 class TestScenarioMessageFormatting:
@@ -324,9 +323,9 @@ class TestScenarioMessageFormatting:
         """<internal> tags in agent output are removed before sending to user."""
         jid = "tg_group_123@telegram"
         channel = FakeChannel(owned_jids=[jid])
-        register_group(channel, jid=jid, groups_dir=env / "groups")
+        await register_group(channel, jid=jid, groups_dir=env / "groups")
 
-        send_user_message(jid, "Tell me about the project")
+        await send_user_message(jid, "Tell me about the project")
         mock = make_agent_mock(
             response="Here's the summary. <internal>I checked CLAUDE.md for context</internal> The project is going well!"
         )
@@ -349,7 +348,7 @@ class TestScenarioTriggerPattern:
         """Message without @Andy in non-main group → ignored."""
         jid = "slack_general@slack"
         channel = FakeChannel(owned_jids=[jid])
-        register_group(
+        await register_group(
             channel,
             jid=jid,
             folder="slack_general",
@@ -358,7 +357,7 @@ class TestScenarioTriggerPattern:
             groups_dir=env / "groups",
         )
 
-        send_user_message(jid, "Just chatting among ourselves")
+        await send_user_message(jid, "Just chatting among ourselves")
         mock = make_agent_mock()
 
         import nanoclaw.main as m
@@ -374,7 +373,7 @@ class TestScenarioTriggerPattern:
         """Message with @Andy in non-main group → agent invoked."""
         jid = "slack_general@slack"
         channel = FakeChannel(owned_jids=[jid])
-        register_group(
+        await register_group(
             channel,
             jid=jid,
             folder="slack_general",
@@ -383,7 +382,7 @@ class TestScenarioTriggerPattern:
             groups_dir=env / "groups",
         )
 
-        send_user_message(jid, "@Andy what's the status of the deploy?")
+        await send_user_message(jid, "@Andy what's the status of the deploy?")
         mock = make_agent_mock(response="Deploy is at 95%, almost done!")
 
         import nanoclaw.main as m
@@ -402,7 +401,7 @@ class TestScenarioIPCFromContainer:
     async def test_container_schedules_cron_task(self, env: Path) -> None:
         """Agent writes a task IPC file → task created in DB."""
         from nanoclaw.core.types import RegisteredGroup
-        from nanoclaw.db.sqlite import get_task_by_id
+        from nanoclaw.db.pg import get_task_by_id
         from nanoclaw.ipc.task_handler import process_task_ipc
 
         registered = {
@@ -423,19 +422,19 @@ class TestScenarioIPCFromContainer:
             def registered_groups(self) -> dict[str, RegisteredGroup]:
                 return registered
 
-            def register_group(self, jid: str, group: RegisteredGroup) -> None:
+            async def register_group(self, jid: str, group: RegisteredGroup) -> None:
                 pass
 
             async def sync_groups(self, force: bool) -> None:
                 pass
 
-            def get_available_groups(self) -> list[object]:
+            async def get_available_groups(self) -> list[object]:
                 return []
 
             def write_groups_snapshot(self, gf: str, im: bool, ag: list[object], rj: set[str]) -> None:
                 pass
 
-            def on_tasks_changed(self) -> None:
+            async def on_tasks_changed(self) -> None:
                 tasks_changed.append(True)
 
         # Simulate agent writing a task file
@@ -453,7 +452,7 @@ class TestScenarioIPCFromContainer:
             FakeDeps(),  # type: ignore[arg-type]
         )
 
-        task = get_task_by_id("daily-standup-001")
+        task = await get_task_by_id("daily-standup-001")
         assert task is not None
         assert task.prompt == "Send daily standup summary"
         assert task.schedule_type == "cron"
@@ -464,7 +463,7 @@ class TestScenarioIPCFromContainer:
     async def test_ipc_task_pause_resume(self, env: Path) -> None:
         """Agent pauses and resumes a task via IPC handler."""
         from nanoclaw.core.types import RegisteredGroup, ScheduledTask
-        from nanoclaw.db.sqlite import create_task, get_task_by_id
+        from nanoclaw.db.pg import create_task, get_task_by_id
         from nanoclaw.ipc.task_handler import process_task_ipc
 
         registered = {
@@ -485,23 +484,23 @@ class TestScenarioIPCFromContainer:
             def registered_groups(self) -> dict[str, RegisteredGroup]:
                 return registered
 
-            def register_group(self, jid: str, group: RegisteredGroup) -> None:
+            async def register_group(self, jid: str, group: RegisteredGroup) -> None:
                 pass
 
             async def sync_groups(self, force: bool) -> None:
                 pass
 
-            def get_available_groups(self) -> list[object]:
+            async def get_available_groups(self) -> list[object]:
                 return []
 
             def write_groups_snapshot(self, gf: str, im: bool, ag: list[object], rj: set[str]) -> None:
                 pass
 
-            def on_tasks_changed(self) -> None:
+            async def on_tasks_changed(self) -> None:
                 tasks_changed.append(True)
 
         # Create a task first
-        create_task(
+        await create_task(
             ScheduledTask(
                 id="task-pause-test",
                 group_folder="mygroup",
@@ -523,7 +522,7 @@ class TestScenarioIPCFromContainer:
             True,
             FakeDeps(),  # type: ignore[arg-type]
         )
-        task = get_task_by_id("task-pause-test")
+        task = await get_task_by_id("task-pause-test")
         assert task is not None
         assert task.status == "paused"
         assert len(tasks_changed) == 1
@@ -535,7 +534,7 @@ class TestScenarioIPCFromContainer:
             True,
             FakeDeps(),  # type: ignore[arg-type]
         )
-        task = get_task_by_id("task-pause-test")
+        task = await get_task_by_id("task-pause-test")
         assert task is not None
         assert task.status == "active"
         assert len(tasks_changed) == 2
@@ -646,9 +645,9 @@ class TestScenarioErrorRecovery:
 
         jid = "tg_group_123@telegram"
         channel = FakeChannel(owned_jids=[jid])
-        register_group(channel, jid=jid, groups_dir=env / "groups")
+        await register_group(channel, jid=jid, groups_dir=env / "groups")
 
-        send_user_message(jid, "This will crash the agent")
+        await send_user_message(jid, "This will crash the agent")
 
         class _FakeHandle:
             name: str = "crash-container"
@@ -685,9 +684,9 @@ class TestScenarioErrorRecovery:
 
         jid = "tg_group_123@telegram"
         channel = FakeChannel(owned_jids=[jid])
-        register_group(channel, jid=jid, groups_dir=env / "groups")
+        await register_group(channel, jid=jid, groups_dir=env / "groups")
 
-        send_user_message(jid, "Start answering then crash")
+        await send_user_message(jid, "Start answering then crash")
 
         class _FakeHandle:
             name: str = "partial-container"
@@ -759,8 +758,6 @@ class TestScenarioCredentialProxy:
                         timeout=aiohttp.ClientTimeout(total=3),
                     ) as resp:
                         # Any response (even error) proves proxy is running
-                        # Any HTTP response proves the proxy is alive and
-                        # forwarding — the exact status depends on upstream
                         assert resp.status > 0
                 except (aiohttp.ClientError, OSError):
                     # Connection error to upstream is expected, proxy still works
@@ -815,12 +812,12 @@ class TestScenarioDatabaseOperations:
     async def test_message_store_and_query(self, env: Path) -> None:
         """Store messages and retrieve them with timestamp filtering."""
         from nanoclaw.core.types import NewMessage
-        from nanoclaw.db.sqlite import get_messages_since, store_chat_metadata, store_message
+        from nanoclaw.db.pg import get_messages_since, store_chat_metadata, store_message
 
-        store_chat_metadata("chat@test", "2024-01-01T00:00:00Z", name="Test Chat")
+        await store_chat_metadata("chat@test", "2024-01-01T00:00:00Z", name="Test Chat")
 
         for i in range(5):
-            store_message(
+            await store_message(
                 NewMessage(
                     id=f"msg-{i}",
                     chat_jid="chat@test",
@@ -832,17 +829,17 @@ class TestScenarioDatabaseOperations:
             )
 
         # Get all
-        all_msgs = get_messages_since("chat@test", "", "Andy")
+        all_msgs = await get_messages_since("chat@test", "", "Andy")
         assert len(all_msgs) == 5
 
         # Get since timestamp
-        since = get_messages_since("chat@test", "2024-06-01T12:00:02Z", "Andy")
+        since = await get_messages_since("chat@test", "2024-06-01T12:00:02Z", "Andy")
         assert len(since) == 2  # messages 3 and 4
 
     async def test_task_crud(self, env: Path) -> None:
         """Create, read, update, delete scheduled tasks."""
         from nanoclaw.core.types import ScheduledTask
-        from nanoclaw.db.sqlite import (
+        from nanoclaw.db.pg import (
             create_task,
             delete_task,
             get_task_by_id,
@@ -861,22 +858,22 @@ class TestScenarioDatabaseOperations:
             status="active",
             created_at="2024-01-01T00:00:00Z",
         )
-        create_task(task)
+        await create_task(task)
 
         # Read
-        fetched = get_task_by_id("test-task")
+        fetched = await get_task_by_id("test-task")
         assert fetched is not None
         assert fetched.prompt == "Check server status"
 
         # Update
-        update_task("test-task", status="paused")
-        fetched = get_task_by_id("test-task")
+        await update_task("test-task", status="paused")
+        fetched = await get_task_by_id("test-task")
         assert fetched is not None
         assert fetched.status == "paused"
 
         # Delete
-        delete_task("test-task")
-        assert get_task_by_id("test-task") is None
+        await delete_task("test-task")
+        assert await get_task_by_id("test-task") is None
 
 
 class TestScenarioMountSecurity:
@@ -926,10 +923,10 @@ class TestScenarioEndToEndFlow:
         """Simulate a full multi-message conversation."""
         jid = "tg_group_123@telegram"
         channel = FakeChannel(owned_jids=[jid])
-        register_group(channel, jid=jid, groups_dir=env / "groups")
+        await register_group(channel, jid=jid, groups_dir=env / "groups")
 
         # === Turn 1: User asks a question ===
-        send_user_message(jid, "Hi Andy, what's our sprint velocity?", timestamp="2024-06-01T12:00:01Z")
+        await send_user_message(jid, "Hi Andy, what's our sprint velocity?", timestamp="2024-06-01T12:00:01Z")
 
         mock1 = make_agent_mock(
             response="Based on the last 3 sprints, your average velocity is 42 story points.",
@@ -947,7 +944,7 @@ class TestScenarioEndToEndFlow:
         assert m._sessions.get("telegram_mygroup") == "sess-turn-1"
 
         # === Turn 2: Follow-up question (different sender) ===
-        send_user_message(
+        await send_user_message(
             jid,
             "Can you break that down by developer?",
             sender="bob_789",
@@ -979,6 +976,6 @@ class TestScenarioEndToEndFlow:
         assert "break that down" in inp.prompt  # type: ignore[union-attr]
 
         # === Verify DB state ===
-        from nanoclaw.db.sqlite import get_session
+        from nanoclaw.db.pg import get_session
 
-        assert get_session("telegram_mygroup") == "sess-turn-2"
+        assert await get_session("telegram_mygroup") == "sess-turn-2"

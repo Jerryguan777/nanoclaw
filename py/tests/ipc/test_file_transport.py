@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from nanoclaw.db.sqlite import _init_test_database
+import pytest
+
 from nanoclaw.ipc.task_handler import process_task_ipc
 
-
-def setup_function() -> None:
-    _init_test_database()
+pytestmark = pytest.mark.usefixtures("test_db")
 
 
 async def test_schedule_task_missing_fields() -> None:
@@ -20,19 +19,19 @@ async def test_schedule_task_missing_fields() -> None:
         def registered_groups(self) -> dict[str, object]:
             return {}
 
-        def register_group(self, jid: str, group: object) -> None:
+        async def register_group(self, jid: str, group: object) -> None:
             pass
 
         async def sync_groups(self, force: bool) -> None:
             pass
 
-        def get_available_groups(self) -> list[object]:
+        async def get_available_groups(self) -> list[object]:
             return []
 
         def write_groups_snapshot(self, gf: str, im: bool, ag: list[object], rj: set[str]) -> None:
             pass
 
-        def on_tasks_changed(self) -> None:
+        async def on_tasks_changed(self) -> None:
             pass
 
     deps = FakeDeps()
@@ -55,19 +54,19 @@ async def test_unknown_task_type() -> None:
         def registered_groups(self) -> dict[str, object]:
             return {}
 
-        def register_group(self, jid: str, group: object) -> None:
+        async def register_group(self, jid: str, group: object) -> None:
             pass
 
         async def sync_groups(self, force: bool) -> None:
             pass
 
-        def get_available_groups(self) -> list[object]:
+        async def get_available_groups(self) -> list[object]:
             return []
 
         def write_groups_snapshot(self, gf: str, im: bool, ag: list[object], rj: set[str]) -> None:
             pass
 
-        def on_tasks_changed(self) -> None:
+        async def on_tasks_changed(self) -> None:
             pass
 
     deps = FakeDeps()

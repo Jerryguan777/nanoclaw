@@ -140,9 +140,7 @@ async def test_run_creates_and_starts() -> None:
     mock_client.containers = MagicMock()
     import aiodocker.exceptions
 
-    mock_client.containers.container = MagicMock(
-        side_effect=aiodocker.exceptions.DockerError(404, "not found")
-    )
+    mock_client.containers.container = MagicMock(side_effect=aiodocker.exceptions.DockerError(404, "not found"))
     mock_client.containers.create_or_replace = AsyncMock(return_value=mock_container)
     rt._client = mock_client
 

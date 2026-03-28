@@ -11,6 +11,7 @@ dependencies = [
     "slack-bolt>=1.27.0",
     "nats-py>=2.9",
     "aiodocker>=0.23",
+    "asyncpg>=0.29",
 ]
 
 [project.scripts]
@@ -23,6 +24,7 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.8",
     "mypy>=1.13",
+    "testcontainers[postgres]>=4.0",
 ]
 
 [build-system]
@@ -71,4 +73,5 @@ fail_under = 80
 [dependency-groups]
 dev = [
     "types-croniter>=6.2.2.20260316",
+    "asyncpg-stubs>=0.31",
 ]

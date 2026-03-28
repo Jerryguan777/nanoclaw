@@ -27,6 +27,7 @@ STORE_DIR: Path = PROJECT_ROOT / "store"
 GROUPS_DIR: Path = PROJECT_ROOT / "groups"
 DATA_DIR: Path = PROJECT_ROOT / "data"
 
+DATABASE_URL: str = os.environ.get("DATABASE_URL", "postgresql://nanoclaw:nanoclaw@localhost:5432/nanoclaw")
 NATS_URL: str = os.environ.get("NATS_URL", "nats://localhost:4222")
 
 CONTAINER_IMAGE: str = os.environ.get("CONTAINER_IMAGE", "nanoclaw-agent:latest")

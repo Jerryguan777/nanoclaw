@@ -8,7 +8,7 @@ This directory contains the Python rewrite of NanoClaw (originally TypeScript).
 - **Type hints everywhere** — `mypy --strict` must pass
 - **dataclasses** for data models, **Protocol** for interfaces
 - **asyncio** for concurrency (polling loops, subprocess, HTTP proxy)
-- **sqlite3 stdlib** for database (synchronous, matching the TS better-sqlite3 model)
+- **asyncpg** for database (async PostgreSQL, all db functions are `async`)
 - **structlog** for logging
 - **pathlib.Path** for all file path operations
 - Code comments and docstrings in **English only**
@@ -24,4 +24,4 @@ The Python version preserves the same architecture as the TypeScript original:
 - Channel self-registration pattern
 - Container-isolated agent execution (Docker)
 - File-based IPC with JSON protocol
-- SQLite persistence
+- PostgreSQL persistence (asyncpg, with tenant_id for future multi-tenant RLS)

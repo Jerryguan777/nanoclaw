@@ -22,7 +22,7 @@ from nanoclaw.core.config import ASSISTANT_NAME, SCHEDULER_POLL_INTERVAL
 from nanoclaw.core.group_folder import resolve_group_folder_path
 from nanoclaw.core.logger import get_logger
 from nanoclaw.core.types import RegisteredGroup, ScheduledTask, TaskRunLog
-from nanoclaw.db.sqlite import (
+from nanoclaw.db.pg import (
     get_all_tasks,
     get_due_tasks,
     get_task_by_id,
@@ -110,9 +110,9 @@ async def _run_task(
         group_dir = resolve_group_folder_path(task.group_folder)
     except ValueError as exc:
         err_msg = str(exc)
-        update_task(task.id, status="paused")
+        await update_task(task.id, status="paused")
         logger.error("Task has invalid group folder", task_id=task.id, group_folder=task.group_folder, error=err_msg)
-        log_task_run(
+        await log_task_run(
             TaskRunLog(
                 task_id=task.id,
                 run_at=datetime.now(UTC).isoformat(),
@@ -133,7 +133,7 @@ async def _run_task(
 
     if group is None:
         logger.error("Group not found for task", task_id=task.id, group_folder=task.group_folder)
-        log_task_run(
+        await log_task_run(
             TaskRunLog(
                 task_id=task.id,
                 run_at=datetime.now(UTC).isoformat(),
@@ -148,7 +148,7 @@ async def _run_task(
     executor = deps.executor
     if executor is None:
         logger.error("Agent executor not available for task", task_id=task.id)
-        log_task_run(
+        await log_task_run(
             TaskRunLog(
                 task_id=task.id,
                 run_at=datetime.now(UTC).isoformat(),
@@ -163,7 +163,7 @@ async def _run_task(
     is_main = group.is_main
     transport = deps.transport
     if transport is not None:
-        all_tasks = get_all_tasks()
+        all_tasks = await get_all_tasks()
         await write_tasks_snapshot(
             transport,
             task.group_folder,
@@ -247,7 +247,7 @@ async def _run_task(
 
     duration_ms = int((time.monotonic() - start_time) * 1000)
 
-    log_task_run(
+    await log_task_run(
         TaskRunLog(
             task_id=task.id,
             run_at=datetime.now(UTC).isoformat(),
@@ -266,7 +266,7 @@ async def _run_task(
         result_summary = result[:200]
     else:
         result_summary = "Completed"
-    update_task_after_run(task.id, next_run, result_summary)
+    await update_task_after_run(task.id, next_run, result_summary)
 
 
 _scheduler_running: bool = False
@@ -287,12 +287,12 @@ def start_scheduler_loop(deps: SchedulerDependencies) -> asyncio.Task[None]:
     async def _loop() -> None:
         while True:
             try:
-                due_tasks = get_due_tasks()
+                due_tasks = await get_due_tasks()
                 if due_tasks:
                     logger.info("Found due tasks", count=len(due_tasks))
 
                 for task in due_tasks:
-                    current_task = get_task_by_id(task.id)
+                    current_task = await get_task_by_id(task.id)
                     if not current_task or current_task.status != "active":
                         continue
 

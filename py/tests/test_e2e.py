@@ -1,7 +1,7 @@
 """End-to-end tests for the NanoClaw Python runtime engine.
 
 Strategy: Mock AgentExecutor, test real logic.
-Uses in-memory SQLite, real GroupQueue, real message routing.
+Uses PostgreSQL via testcontainers, real GroupQueue, real message routing.
 """
 
 from __future__ import annotations
@@ -58,8 +58,8 @@ class MockChannel:
 
 
 @pytest.fixture
-def e2e_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Set up isolated E2E environment with tmp dirs and in-memory DB."""
+async def e2e_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_url: str) -> Path:
+    """Set up isolated E2E environment with tmp dirs and PG test DB."""
     data_dir = tmp_path / "data"
     groups_dir = tmp_path / "groups"
     store_dir = tmp_path / "store"
@@ -84,11 +84,15 @@ def e2e_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr("nanoclaw.main.ASSISTANT_NAME", "Andy")
     monkeypatch.setattr("nanoclaw.main.TRIGGER_PATTERN", re.compile(r"^@Andy\b", re.IGNORECASE))
 
-    from nanoclaw.db.sqlite import _init_test_database
+    from nanoclaw.db.pg import _init_test_database
 
-    _init_test_database()
+    await _init_test_database(pg_url)
 
-    return tmp_path
+    yield tmp_path
+
+    from nanoclaw.db.pg import close_database
+
+    await close_database()
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +171,7 @@ def make_container_mock(
 # ---------------------------------------------------------------------------
 
 
-def setup_main_state(
+async def setup_main_state(
     channel: MockChannel,
     group_jid: str = "chat@test",
     group_folder: str = "testgroup",
@@ -177,7 +181,7 @@ def setup_main_state(
     """Wire up main.py module-level state for testing."""
     import nanoclaw.main as m
     from nanoclaw.core.types import RegisteredGroup
-    from nanoclaw.db.sqlite import set_registered_group, store_chat_metadata
+    from nanoclaw.db.pg import set_registered_group, store_chat_metadata
 
     group = RegisteredGroup(
         name="Test Group",
@@ -196,8 +200,8 @@ def setup_main_state(
     m._queue = m.GroupQueue()
     m._queue.set_process_messages_fn(m._process_group_messages)
 
-    set_registered_group(group_jid, group)
-    store_chat_metadata(group_jid, "2024-01-01T00:00:00Z", name="Test Group")
+    await set_registered_group(group_jid, group)
+    await store_chat_metadata(group_jid, "2024-01-01T00:00:00Z", name="Test Group")
 
     # Create group folder on disk
     if groups_dir:
@@ -206,7 +210,7 @@ def setup_main_state(
         (gdir / "logs").mkdir(exist_ok=True)
 
 
-def inject_message(
+async def inject_message(
     group_jid: str,
     content: str,
     sender: str = "user@test",
@@ -216,9 +220,9 @@ def inject_message(
 ) -> None:
     """Store a message directly in the DB as if a channel delivered it."""
     from nanoclaw.core.types import NewMessage
-    from nanoclaw.db.sqlite import store_message
+    from nanoclaw.db.pg import store_message
 
-    store_message(
+    await store_message(
         NewMessage(
             id=msg_id or f"msg-{id(content)}",
             chat_jid=group_jid,
@@ -239,9 +243,9 @@ async def test_message_inbound_to_response(e2e_env: Path) -> None:
     """Full flow: message stored → process_group_messages → container mock → channel sends response."""
     channel = MockChannel(owned_jids=["chat@test"])
     groups_dir = e2e_env / "groups"
-    setup_main_state(channel, groups_dir=groups_dir)
+    await setup_main_state(channel, groups_dir=groups_dir)
 
-    inject_message("chat@test", "Hello Andy, what's the weather?")
+    await inject_message("chat@test", "Hello Andy, what's the weather?")
 
     mock_agent = make_container_mock(response_text="It's sunny today!")
 
@@ -260,10 +264,12 @@ async def test_trigger_pattern_required(e2e_env: Path) -> None:
     """Non-main groups require trigger word to activate."""
     channel = MockChannel(owned_jids=["group@test"])
     groups_dir = e2e_env / "groups"
-    setup_main_state(channel, group_jid="group@test", group_folder="nonmain", is_main=False, groups_dir=groups_dir)
+    await setup_main_state(
+        channel, group_jid="group@test", group_folder="nonmain", is_main=False, groups_dir=groups_dir
+    )
 
     # Message without trigger → should not invoke container
-    inject_message("group@test", "Just a regular message")
+    await inject_message("group@test", "Just a regular message")
 
     mock_agent = make_container_mock()
 
@@ -281,9 +287,11 @@ async def test_trigger_pattern_activates(e2e_env: Path) -> None:
     """Non-main groups respond when trigger word is present."""
     channel = MockChannel(owned_jids=["group@test"])
     groups_dir = e2e_env / "groups"
-    setup_main_state(channel, group_jid="group@test", group_folder="triggergrp", is_main=False, groups_dir=groups_dir)
+    await setup_main_state(
+        channel, group_jid="group@test", group_folder="triggergrp", is_main=False, groups_dir=groups_dir
+    )
 
-    inject_message("group@test", "@Andy what time is it?")
+    await inject_message("group@test", "@Andy what time is it?")
 
     mock_agent = make_container_mock(response_text="It's 3pm")
 
@@ -301,9 +309,9 @@ async def test_session_persistence(e2e_env: Path) -> None:
     """Container returns new_session_id → persisted for next call."""
     channel = MockChannel(owned_jids=["chat@test"])
     groups_dir = e2e_env / "groups"
-    setup_main_state(channel, groups_dir=groups_dir)
+    await setup_main_state(channel, groups_dir=groups_dir)
 
-    inject_message("chat@test", "First message")
+    await inject_message("chat@test", "First message")
 
     mock_agent = make_container_mock(response_text="Got it", new_session_id="sess-abc-123")
 
@@ -315,18 +323,18 @@ async def test_session_persistence(e2e_env: Path) -> None:
     # Session should be persisted
     assert m._sessions.get("testgroup") == "sess-abc-123"
 
-    from nanoclaw.db.sqlite import get_session
+    from nanoclaw.db.pg import get_session
 
-    assert get_session("testgroup") == "sess-abc-123"
+    assert await get_session("testgroup") == "sess-abc-123"
 
 
 async def test_error_rollback(e2e_env: Path) -> None:
     """Container error → cursor rolled back for retry."""
     channel = MockChannel(owned_jids=["chat@test"])
     groups_dir = e2e_env / "groups"
-    setup_main_state(channel, groups_dir=groups_dir)
+    await setup_main_state(channel, groups_dir=groups_dir)
 
-    inject_message("chat@test", "This will fail")
+    await inject_message("chat@test", "This will fail")
 
     mock_agent = make_container_mock(status="error", error="Container crashed", response_text="")
 
@@ -344,9 +352,9 @@ async def test_internal_tags_stripped(e2e_env: Path) -> None:
     """<internal> tags in agent response are stripped before sending."""
     channel = MockChannel(owned_jids=["chat@test"])
     groups_dir = e2e_env / "groups"
-    setup_main_state(channel, groups_dir=groups_dir)
+    await setup_main_state(channel, groups_dir=groups_dir)
 
-    inject_message("chat@test", "Tell me something")
+    await inject_message("chat@test", "Tell me something")
 
     mock_agent = make_container_mock(response_text="Visible text <internal>hidden reasoning</internal> more visible")
 
@@ -365,9 +373,9 @@ async def test_typing_indicator(e2e_env: Path) -> None:
     """Typing indicators are sent before and after processing."""
     channel = MockChannel(owned_jids=["chat@test"])
     groups_dir = e2e_env / "groups"
-    setup_main_state(channel, groups_dir=groups_dir)
+    await setup_main_state(channel, groups_dir=groups_dir)
 
-    inject_message("chat@test", "Hello")
+    await inject_message("chat@test", "Hello")
 
     mock_agent = make_container_mock(response_text="Hi there")
 
@@ -385,9 +393,9 @@ async def test_format_messages_xml(e2e_env: Path) -> None:
     """Messages are formatted as XML before being passed to container."""
     channel = MockChannel(owned_jids=["chat@test"])
     groups_dir = e2e_env / "groups"
-    setup_main_state(channel, groups_dir=groups_dir)
+    await setup_main_state(channel, groups_dir=groups_dir)
 
-    inject_message("chat@test", "Hello world", sender_name="Alice")
+    await inject_message("chat@test", "Hello world", sender_name="Alice")
 
     captured_prompts: list[str] = []
 
@@ -429,11 +437,11 @@ async def test_format_messages_xml(e2e_env: Path) -> None:
 async def test_sender_allowlist_drop_mode(e2e_env: Path) -> None:
     """Drop mode: messages from non-allowed senders are not stored."""
     from nanoclaw.core.types import NewMessage
-    from nanoclaw.db.sqlite import get_messages_since
+    from nanoclaw.db.pg import get_messages_since
     from nanoclaw.security.sender_allowlist import ChatAllowlistEntry, SenderAllowlistConfig
 
     channel = MockChannel(owned_jids=["chat@test"])
-    setup_main_state(channel)
+    await setup_main_state(channel)
 
     # Set up drop-mode allowlist
     drop_config = SenderAllowlistConfig(
@@ -462,19 +470,19 @@ async def test_sender_allowlist_drop_mode(e2e_env: Path) -> None:
             ):
                 pass  # Message dropped
             else:
-                from nanoclaw.db.sqlite import store_message
+                from nanoclaw.db.pg import store_message
 
-                store_message(msg)
+                await store_message(msg)
 
     # Message should NOT be in DB
-    msgs = get_messages_since("chat@test", "", "Andy")
+    msgs = await get_messages_since("chat@test", "", "Andy")
     assert len(msgs) == 0
 
 
 async def test_ipc_task_scheduling(e2e_env: Path) -> None:
     """IPC task file → creates scheduled task in DB."""
     from nanoclaw.core.types import RegisteredGroup
-    from nanoclaw.db.sqlite import get_task_by_id
+    from nanoclaw.db.pg import get_task_by_id
     from nanoclaw.ipc.task_handler import process_task_ipc
 
     registered = {
@@ -486,7 +494,7 @@ async def test_ipc_task_scheduling(e2e_env: Path) -> None:
         )
     }
 
-    tasks_changed = []
+    tasks_changed: list[bool] = []
 
     class FakeDeps:
         async def send_message(self, jid: str, text: str) -> None:
@@ -495,19 +503,19 @@ async def test_ipc_task_scheduling(e2e_env: Path) -> None:
         def registered_groups(self) -> dict[str, RegisteredGroup]:
             return registered
 
-        def register_group(self, jid: str, group: RegisteredGroup) -> None:
+        async def register_group(self, jid: str, group: RegisteredGroup) -> None:
             pass
 
         async def sync_groups(self, force: bool) -> None:
             pass
 
-        def get_available_groups(self) -> list[object]:
+        async def get_available_groups(self) -> list[object]:
             return []
 
         def write_groups_snapshot(self, gf: str, im: bool, ag: list[object], rj: set[str]) -> None:
             pass
 
-        def on_tasks_changed(self) -> None:
+        async def on_tasks_changed(self) -> None:
             tasks_changed.append(True)
 
     deps = FakeDeps()
@@ -526,7 +534,7 @@ async def test_ipc_task_scheduling(e2e_env: Path) -> None:
         deps,  # type: ignore[arg-type]
     )
 
-    task = get_task_by_id("test-task-001")
+    task = await get_task_by_id("test-task-001")
     assert task is not None
     assert task.prompt == "Check the weather"
     assert task.schedule_type == "cron"
@@ -558,19 +566,19 @@ async def test_ipc_task_handler_message_auth(e2e_env: Path) -> None:
         def registered_groups(self) -> dict[str, RegisteredGroup]:
             return registered
 
-        def register_group(self, jid: str, group: RegisteredGroup) -> None:
+        async def register_group(self, jid: str, group: RegisteredGroup) -> None:
             pass
 
         async def sync_groups(self, force: bool) -> None:
             pass
 
-        def get_available_groups(self) -> list[object]:
+        async def get_available_groups(self) -> list[object]:
             return []
 
         def write_groups_snapshot(self, gf: str, im: bool, ag: list[object], rj: set[str]) -> None:
             pass
 
-        def on_tasks_changed(self) -> None:
+        async def on_tasks_changed(self) -> None:
             tasks_changed.append(True)
 
     deps = FakeDeps()

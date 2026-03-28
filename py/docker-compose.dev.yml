@@ -8,5 +8,17 @@ services:
     volumes:
       - nats-data:/data
 
+  postgres:
+    image: postgres:16
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: nanoclaw
+      POSTGRES_USER: nanoclaw
+      POSTGRES_PASSWORD: nanoclaw
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
 volumes:
   nats-data:
+  pgdata:

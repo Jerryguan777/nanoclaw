@@ -104,7 +104,7 @@ class TelegramChannel:
                             break
 
             is_group = chat.type in ("group", "supergroup")
-            self._opts.on_chat_metadata(chat_jid, timestamp, chat_name, "telegram", is_group)
+            await self._opts.on_chat_metadata(chat_jid, timestamp, chat_name, "telegram", is_group)
 
             group = self._opts.registered_groups().get(chat_jid)
             if not group:
@@ -142,7 +142,7 @@ class TelegramChannel:
                 sender_name = user.first_name if user else "Unknown"
                 caption = f" {msg.caption}" if msg.caption else ""
                 is_group = chat.type in ("group", "supergroup")
-                self._opts.on_chat_metadata(chat_jid, timestamp, None, "telegram", is_group)
+                await self._opts.on_chat_metadata(chat_jid, timestamp, None, "telegram", is_group)
                 self._opts.on_message(
                     chat_jid,
                     NewMessage(
@@ -188,7 +188,7 @@ class TelegramChannel:
                 sender_name = user.first_name if user else "Unknown"
                 caption = f" {msg.caption}" if msg.caption else ""
                 is_group = chat.type in ("group", "supergroup")
-                self._opts.on_chat_metadata(chat_jid, timestamp, None, "telegram", is_group)
+                await self._opts.on_chat_metadata(chat_jid, timestamp, None, "telegram", is_group)
                 self._opts.on_message(
                     chat_jid,
                     NewMessage(

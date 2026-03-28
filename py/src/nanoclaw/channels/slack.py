@@ -17,7 +17,7 @@ from nanoclaw.core.config import ASSISTANT_NAME, TRIGGER_PATTERN
 from nanoclaw.core.env import read_env_file
 from nanoclaw.core.logger import get_logger
 from nanoclaw.core.types import NewMessage
-from nanoclaw.db.sqlite import update_chat_name
+from nanoclaw.db.pg import update_chat_name
 
 logger = get_logger()
 
@@ -68,7 +68,7 @@ class SlackChannel:
             timestamp = _slack_ts_to_iso(ts)
             is_group = event.get("channel_type") != "im"
 
-            self._opts.on_chat_metadata(jid, timestamp, None, "slack", is_group)
+            await self._opts.on_chat_metadata(jid, timestamp, None, "slack", is_group)
 
             groups = self._opts.registered_groups()
             if jid not in groups:
@@ -177,7 +177,7 @@ class SlackChannel:
                 channels_list: Any = result.get("channels", [])
                 for ch in channels_list:
                     if ch.get("id") and ch.get("name") and ch.get("is_member"):
-                        update_chat_name(f"slack:{ch['id']}", ch["name"])
+                        await update_chat_name(f"slack:{ch['id']}", ch["name"])
                         count += 1
 
                 resp_meta: Any = result.get("response_metadata", {})

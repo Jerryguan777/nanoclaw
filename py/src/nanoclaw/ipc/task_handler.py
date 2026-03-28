@@ -18,7 +18,7 @@ from croniter import croniter
 from nanoclaw.core.group_folder import is_valid_group_folder
 from nanoclaw.core.logger import get_logger
 from nanoclaw.core.types import RegisteredGroup, ScheduledTask
-from nanoclaw.db.sqlite import create_task, delete_task, get_task_by_id, update_task
+from nanoclaw.db.pg import create_task, delete_task, get_task_by_id, update_task
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable
@@ -33,9 +33,9 @@ class IpcDeps(Protocol):
 
     def send_message(self, jid: str, text: str) -> Awaitable[None]: ...
     def registered_groups(self) -> dict[str, RegisteredGroup]: ...
-    def register_group(self, jid: str, group: RegisteredGroup) -> None: ...
+    def register_group(self, jid: str, group: RegisteredGroup) -> Awaitable[None]: ...
     def sync_groups(self, force: bool) -> Awaitable[None]: ...
-    def get_available_groups(self) -> list[AvailableGroup]: ...
+    def get_available_groups(self) -> Awaitable[list[AvailableGroup]]: ...
     def write_groups_snapshot(
         self,
         group_folder: str,
@@ -43,7 +43,7 @@ class IpcDeps(Protocol):
         available_groups: list[AvailableGroup],
         registered_jids: set[str],
     ) -> None: ...
-    def on_tasks_changed(self) -> None: ...
+    def on_tasks_changed(self) -> Awaitable[None]: ...
 
 
 async def process_task_ipc(
@@ -120,7 +120,7 @@ async def process_task_ipc(
         raw_context = data.get("context_mode")
         context_mode: str = raw_context if raw_context in ("group", "isolated") else "isolated"  # type: ignore[assignment]
 
-        create_task(
+        await create_task(
             ScheduledTask(
                 id=task_id,
                 group_folder=target_folder,
@@ -141,17 +141,17 @@ async def process_task_ipc(
             target_folder=target_folder,
             context_mode=context_mode,
         )
-        deps.on_tasks_changed()
+        await deps.on_tasks_changed()
 
     elif task_type == "pause_task":
         task_id_val = data.get("taskId")
         if task_id_val:
             assert isinstance(task_id_val, str)
-            task = get_task_by_id(task_id_val)
+            task = await get_task_by_id(task_id_val)
             if task and (is_main or task.group_folder == source_group):
-                update_task(task_id_val, status="paused")
+                await update_task(task_id_val, status="paused")
                 logger.info("Task paused via IPC", task_id=task_id_val, source_group=source_group)
-                deps.on_tasks_changed()
+                await deps.on_tasks_changed()
             else:
                 logger.warning("Unauthorized task pause attempt", task_id=task_id_val, source_group=source_group)
 
@@ -159,11 +159,11 @@ async def process_task_ipc(
         task_id_val = data.get("taskId")
         if task_id_val:
             assert isinstance(task_id_val, str)
-            task = get_task_by_id(task_id_val)
+            task = await get_task_by_id(task_id_val)
             if task and (is_main or task.group_folder == source_group):
-                update_task(task_id_val, status="active")
+                await update_task(task_id_val, status="active")
                 logger.info("Task resumed via IPC", task_id=task_id_val, source_group=source_group)
-                deps.on_tasks_changed()
+                await deps.on_tasks_changed()
             else:
                 logger.warning("Unauthorized task resume attempt", task_id=task_id_val, source_group=source_group)
 
@@ -171,11 +171,11 @@ async def process_task_ipc(
         task_id_val = data.get("taskId")
         if task_id_val:
             assert isinstance(task_id_val, str)
-            task = get_task_by_id(task_id_val)
+            task = await get_task_by_id(task_id_val)
             if task and (is_main or task.group_folder == source_group):
-                delete_task(task_id_val)
+                await delete_task(task_id_val)
                 logger.info("Task cancelled via IPC", task_id=task_id_val, source_group=source_group)
-                deps.on_tasks_changed()
+                await deps.on_tasks_changed()
             else:
                 logger.warning("Unauthorized task cancel attempt", task_id=task_id_val, source_group=source_group)
 
@@ -185,7 +185,7 @@ async def process_task_ipc(
             return
         assert isinstance(task_id_val, str)
 
-        task = get_task_by_id(task_id_val)
+        task = await get_task_by_id(task_id_val)
         if not task:
             logger.warning("Task not found for update", task_id=task_id_val, source_group=source_group)
             return
@@ -227,15 +227,15 @@ async def process_task_ipc(
                 except (ValueError, TypeError):
                     pass
 
-        update_task(task_id_val, **updates)
+        await update_task(task_id_val, **updates)
         logger.info("Task updated via IPC", task_id=task_id_val, source_group=source_group, updates=updates)
-        deps.on_tasks_changed()
+        await deps.on_tasks_changed()
 
     elif task_type == "refresh_groups":
         if is_main:
             logger.info("Group metadata refresh requested via IPC", source_group=source_group)
             await deps.sync_groups(True)
-            available_groups = deps.get_available_groups()
+            available_groups = await deps.get_available_groups()
             deps.write_groups_snapshot(
                 source_group,
                 True,
@@ -271,7 +271,7 @@ async def process_task_ipc(
 
             requires_trigger = data.get("requiresTrigger")
             # Defense in depth: agent cannot set isMain via IPC
-            deps.register_group(
+            await deps.register_group(
                 jid,
                 RegisteredGroup(
                     name=name,

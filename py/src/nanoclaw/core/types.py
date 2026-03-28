@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Literal, Protocol, runtime_checkable
 
@@ -137,4 +137,4 @@ class SyncableChannel(Protocol):
 
 # Callback types
 OnInboundMessage = Callable[[str, "NewMessage"], None]
-OnChatMetadata = Callable[[str, str, str | None, str | None, bool | None], None]
+OnChatMetadata = Callable[[str, str, str | None, str | None, bool | None], "Awaitable[None]"]
