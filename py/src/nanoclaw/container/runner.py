@@ -358,6 +358,7 @@ async def run_container_agent(
         stderr=asyncio.subprocess.PIPE,
     )
 
+    # callback function to register container into GroupQueue
     on_process(proc, container_name, job_id)
 
     stderr_buf = ""
@@ -376,7 +377,6 @@ async def run_container_agent(
 
     # Timeout management via an asyncio.Event and a watcher task
     activity_event = asyncio.Event()
-    timeout_fired = asyncio.Event()
 
     async def _timeout_watcher() -> None:
         nonlocal timed_out
@@ -386,7 +386,6 @@ async def run_container_agent(
                 await asyncio.wait_for(activity_event.wait(), timeout=timeout_s)
             except TimeoutError:
                 timed_out = True
-                timeout_fired.set()
                 logger.error(
                     "Container timeout, stopping gracefully",
                     group=group.name,
@@ -411,7 +410,7 @@ async def run_container_agent(
                     proc.kill()
                 return
 
-    timeout_task = asyncio.create_task(_timeout_watcher())
+    timeout_task = asyncio.create_task(_timeout_watcher()) # why asycn?
 
     # Channel 2: Subscribe to JetStream for streaming results
     results_sub = None
