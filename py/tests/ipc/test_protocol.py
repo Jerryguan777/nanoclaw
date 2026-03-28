@@ -15,6 +15,8 @@ def test_agent_init_data_roundtrip() -> None:
         session_id="sess-001",
         is_scheduled_task=False,
         assistant_name="Andy",
+        system_prompt="Be helpful",
+        role_config={"role": "coder"},
     )
     data = init.serialize()
     restored = AgentInitData.deserialize(data)
@@ -25,6 +27,8 @@ def test_agent_init_data_roundtrip() -> None:
     assert restored.session_id == init.session_id
     assert restored.is_scheduled_task == init.is_scheduled_task
     assert restored.assistant_name == init.assistant_name
+    assert restored.system_prompt == init.system_prompt
+    assert restored.role_config == init.role_config
 
 
 def test_agent_init_data_optional_fields() -> None:
@@ -40,6 +44,8 @@ def test_agent_init_data_optional_fields() -> None:
     assert restored.session_id is None
     assert restored.is_scheduled_task is False
     assert restored.assistant_name is None
+    assert restored.system_prompt is None
+    assert restored.role_config is None
 
 
 def test_agent_init_data_frozen() -> None:

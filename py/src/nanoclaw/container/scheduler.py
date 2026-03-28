@@ -17,6 +17,7 @@ from nanoclaw.core.logger import get_logger
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
+    from nanoclaw.container.runtime import ContainerHandle, ContainerRuntime
     from nanoclaw.ipc.nats_transport import NatsTransport
 
 from nanoclaw.core.config import MAX_CONCURRENT_CONTAINERS
@@ -42,7 +43,7 @@ class _GroupState:
     running_task_id: str | None = None
     pending_messages: bool = False
     pending_tasks: list[_QueuedTask] = field(default_factory=list)
-    process: object | None = None  # asyncio.subprocess.Process
+    process: ContainerHandle | None = None
     container_name: str | None = None
     group_folder: str | None = None
     job_id: str | None = None
@@ -52,7 +53,11 @@ class _GroupState:
 class GroupQueue:
     """Manages per-group container concurrency and task/message queuing."""
 
-    def __init__(self, transport: NatsTransport | None = None) -> None:
+    def __init__(
+        self,
+        transport: NatsTransport | None = None,
+        runtime: ContainerRuntime | None = None,
+    ) -> None:
         self._groups: dict[str, _GroupState] = {}
         self._active_count: int = 0
         self._waiting_groups: list[str] = []
@@ -60,6 +65,7 @@ class GroupQueue:
         self._shutting_down: bool = False
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._transport = transport
+        self._runtime = runtime
 
     def _spawn(self, coro: Awaitable[None]) -> None:
         """Launch a background task and track it to prevent GC."""
@@ -144,12 +150,12 @@ class GroupQueue:
     def register_process(
         self,
         group_jid: str,
-        proc: object,
+        proc: ContainerHandle,
         container_name: str,
         group_folder: str | None = None,
         job_id: str | None = None,
     ) -> None:
-        """Track an active container process for a group."""
+        """Track an active container handle for a group."""
         state = self._get_group(group_jid)
         state.process = proc
         state.container_name = container_name
@@ -353,3 +359,11 @@ class GroupQueue:
             active_count=self._active_count,
             detached_containers=active_containers,
         )
+
+        # Stop active containers via runtime if available
+        if self._runtime:
+            for name in active_containers:
+                try:
+                    await self._runtime.stop(name)
+                except (OSError, RuntimeError):
+                    logger.debug("Failed to stop container during shutdown", container=name)

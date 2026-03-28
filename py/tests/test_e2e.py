@@ -1,6 +1,6 @@
 """End-to-end tests for the NanoClaw Python runtime engine.
 
-Strategy: Mock Docker (run_container_agent), test real logic.
+Strategy: Mock AgentExecutor, test real logic.
 Uses in-memory SQLite, real GroupQueue, real message routing.
 """
 
@@ -96,41 +96,70 @@ def e2e_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def make_container_mock(
-    response_text: str = "Hello from the agent!",
-    new_session_id: str | None = "sess-001",
-    status: str = "success",
-    error: str | None = None,
-) -> Callable[..., Awaitable[object]]:
-    """Create a mock for run_container_agent that simulates container execution."""
-    from nanoclaw.container.runner import ContainerOutput
+class _FakeHandle:
+    """Minimal ContainerHandle for tests."""
 
-    captured_inputs: list[object] = []
+    @property
+    def name(self) -> str:
+        return "test-container-mock"
 
-    async def mock_run_container_agent(
-        group: object,
+    @property
+    def pid(self) -> int:
+        return 12345
+
+
+class MockExecutor:
+    """Mock AgentExecutor that captures inputs and returns canned outputs."""
+
+    def __init__(
+        self,
+        response_text: str = "Hello from the agent!",
+        new_session_id: str | None = "sess-001",
+        status: str = "success",
+        error: str | None = None,
+    ) -> None:
+        self._response_text = response_text
+        self._new_session_id = new_session_id
+        self._status = status
+        self._error = error
+        self.captured_inputs: list[object] = []
+
+    @property
+    def name(self) -> str:
+        return "mock"
+
+    async def execute(
+        self,
         inp: object,
         on_process: Callable[..., None],
         on_output: Callable[..., Awaitable[None]] | None = None,
-        transport: object | None = None,
-    ) -> ContainerOutput:
-        captured_inputs.append(inp)
-        on_process(object(), "test-container-mock", "test-job")
+    ) -> object:
+        from nanoclaw.agent import AgentOutput
 
-        output = ContainerOutput(
-            status=status,  # type: ignore[arg-type]
-            result=response_text if status == "success" else None,
-            new_session_id=new_session_id,
-            error=error,
+        self.captured_inputs.append(inp)
+        on_process(_FakeHandle(), "test-container-mock", "test-job")
+
+        output = AgentOutput(
+            status=self._status,  # type: ignore[arg-type]
+            result=self._response_text if self._status == "success" else None,
+            new_session_id=self._new_session_id,
+            error=self._error,
         )
 
         if on_output is not None:
             await on_output(output)
 
-        return ContainerOutput(status="success", result=None, new_session_id=new_session_id)
+        return AgentOutput(status="success", result=None, new_session_id=self._new_session_id)
 
-    mock_run_container_agent.captured_inputs = captured_inputs  # type: ignore[attr-defined]
-    return mock_run_container_agent  # type: ignore[return-value]
+
+def make_container_mock(
+    response_text: str = "Hello from the agent!",
+    new_session_id: str | None = "sess-001",
+    status: str = "success",
+    error: str | None = None,
+) -> MockExecutor:
+    """Create a MockExecutor that simulates container execution."""
+    return MockExecutor(response_text=response_text, new_session_id=new_session_id, status=status, error=error)
 
 
 # ---------------------------------------------------------------------------
@@ -216,10 +245,10 @@ async def test_message_inbound_to_response(e2e_env: Path) -> None:
 
     mock_agent = make_container_mock(response_text="It's sunny today!")
 
-    with patch("nanoclaw.main.run_container_agent", mock_agent):
-        import nanoclaw.main as m
+    import nanoclaw.main as m
 
-        result = await m._process_group_messages("chat@test")
+    m._executor = mock_agent  # type: ignore[assignment]
+    result = await m._process_group_messages("chat@test")
 
     assert result is True
     assert len(channel.sent) == 1
@@ -238,14 +267,14 @@ async def test_trigger_pattern_required(e2e_env: Path) -> None:
 
     mock_agent = make_container_mock()
 
-    with patch("nanoclaw.main.run_container_agent", mock_agent):
-        import nanoclaw.main as m
+    import nanoclaw.main as m
 
-        result = await m._process_group_messages("group@test")
+    m._executor = mock_agent  # type: ignore[assignment]
+    result = await m._process_group_messages("group@test")
 
     assert result is True
     assert len(channel.sent) == 0  # No response sent
-    assert len(mock_agent.captured_inputs) == 0  # type: ignore[attr-defined]
+    assert len(mock_agent.captured_inputs) == 0
 
 
 async def test_trigger_pattern_activates(e2e_env: Path) -> None:
@@ -258,10 +287,10 @@ async def test_trigger_pattern_activates(e2e_env: Path) -> None:
 
     mock_agent = make_container_mock(response_text="It's 3pm")
 
-    with patch("nanoclaw.main.run_container_agent", mock_agent):
-        import nanoclaw.main as m
+    import nanoclaw.main as m
 
-        result = await m._process_group_messages("group@test")
+    m._executor = mock_agent  # type: ignore[assignment]
+    result = await m._process_group_messages("group@test")
 
     assert result is True
     assert len(channel.sent) == 1
@@ -278,10 +307,10 @@ async def test_session_persistence(e2e_env: Path) -> None:
 
     mock_agent = make_container_mock(response_text="Got it", new_session_id="sess-abc-123")
 
-    with patch("nanoclaw.main.run_container_agent", mock_agent):
-        import nanoclaw.main as m
+    import nanoclaw.main as m
 
-        await m._process_group_messages("chat@test")
+    m._executor = mock_agent  # type: ignore[assignment]
+    await m._process_group_messages("chat@test")
 
     # Session should be persisted
     assert m._sessions.get("testgroup") == "sess-abc-123"
@@ -301,10 +330,10 @@ async def test_error_rollback(e2e_env: Path) -> None:
 
     mock_agent = make_container_mock(status="error", error="Container crashed", response_text="")
 
-    with patch("nanoclaw.main.run_container_agent", mock_agent):
-        import nanoclaw.main as m
+    import nanoclaw.main as m
 
-        result = await m._process_group_messages("chat@test")
+    m._executor = mock_agent  # type: ignore[assignment]
+    result = await m._process_group_messages("chat@test")
 
     assert result is False  # Signal retry
     # Cursor should be rolled back (empty or previous value)
@@ -321,10 +350,10 @@ async def test_internal_tags_stripped(e2e_env: Path) -> None:
 
     mock_agent = make_container_mock(response_text="Visible text <internal>hidden reasoning</internal> more visible")
 
-    with patch("nanoclaw.main.run_container_agent", mock_agent):
-        import nanoclaw.main as m
+    import nanoclaw.main as m
 
-        await m._process_group_messages("chat@test")
+    m._executor = mock_agent  # type: ignore[assignment]
+    await m._process_group_messages("chat@test")
 
     assert len(channel.sent) == 1
     assert "hidden reasoning" not in channel.sent[0][1]
@@ -342,10 +371,10 @@ async def test_typing_indicator(e2e_env: Path) -> None:
 
     mock_agent = make_container_mock(response_text="Hi there")
 
-    with patch("nanoclaw.main.run_container_agent", mock_agent):
-        import nanoclaw.main as m
+    import nanoclaw.main as m
 
-        await m._process_group_messages("chat@test")
+    m._executor = mock_agent  # type: ignore[assignment]
+    await m._process_group_messages("chat@test")
 
     # Should have typing=True then typing=False
     assert ("chat@test", True) in channel.typing_events
@@ -362,25 +391,32 @@ async def test_format_messages_xml(e2e_env: Path) -> None:
 
     captured_prompts: list[str] = []
 
-    from nanoclaw.container.runner import ContainerInput, ContainerOutput
+    from nanoclaw.agent import AgentInput, AgentOutput
 
-    async def capturing_mock(
-        group: object,
-        inp: ContainerInput,
-        on_process: Callable[..., None],
-        on_output: Callable[..., Awaitable[None]] | None = None,
-        transport: object | None = None,
-    ) -> ContainerOutput:
-        captured_prompts.append(inp.prompt)
-        on_process(object(), "test-container", "test-job")
-        if on_output:
-            await on_output(ContainerOutput(status="success", result="OK"))
-        return ContainerOutput(status="success", result=None)
+    class CapturingExecutor:
+        """Mock executor that captures prompts."""
 
-    with patch("nanoclaw.main.run_container_agent", capturing_mock):
-        import nanoclaw.main as m
+        @property
+        def name(self) -> str:
+            return "capturing-mock"
 
-        await m._process_group_messages("chat@test")
+        async def execute(
+            self,
+            inp: AgentInput,
+            on_process: Callable[..., None],
+            on_output: Callable[..., Awaitable[None]] | None = None,
+        ) -> AgentOutput:
+            captured_prompts.append(inp.prompt)
+            on_process(_FakeHandle(), "test-container", "test-job")
+            output = AgentOutput(status="success", result="OK")
+            if on_output:
+                await on_output(output)
+            return AgentOutput(status="success", result=None)
+
+    import nanoclaw.main as m
+
+    m._executor = CapturingExecutor()  # type: ignore[assignment]
+    await m._process_group_messages("chat@test")
 
     assert len(captured_prompts) == 1
     prompt = captured_prompts[0]

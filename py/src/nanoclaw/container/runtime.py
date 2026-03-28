@@ -1,34 +1,127 @@
-"""Container runtime abstraction (Docker).
+"""Container runtime abstraction.
 
-All runtime-specific logic lives here so swapping runtimes means changing one file.
+Defines the ContainerRuntime Protocol and supporting types (ContainerSpec,
+ContainerHandle, VolumeMount).  Concrete implementations live in separate
+modules (e.g. docker_runtime.py).
+
+Platform helpers for proxy bind-host and host-gateway detection are kept as
+module-level functions so they can be used regardless of runtime.
 """
 
 from __future__ import annotations
 
-import contextlib
 import os
 import platform
-import subprocess
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
 from nanoclaw.core.logger import get_logger
 
 logger = get_logger()
 
-CONTAINER_RUNTIME_BIN: str = "docker"
+# ---------------------------------------------------------------------------
+# Data types
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class VolumeMount:
+    """A bind mount specification for container execution."""
+
+    host_path: str
+    container_path: str
+    readonly: bool
+
+
+@dataclass(frozen=True)
+class ContainerSpec:
+    """Full specification for running a container."""
+
+    name: str
+    image: str
+    mounts: list[VolumeMount] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
+    user: str | None = None  # "uid:gid"
+    memory_limit: str | None = None  # "512m"
+    cpu_limit: float | None = None  # 1.0
+    extra_hosts: dict[str, str] = field(default_factory=dict)
+    remove_on_exit: bool = True
+    entrypoint: list[str] | None = None
+
+
+# ---------------------------------------------------------------------------
+# Protocols
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class ContainerHandle(Protocol):
+    """Handle to a running container."""
+
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def pid(self) -> int:
+        """Process ID (or container ID hash) for tracking."""
+        ...
+
+    async def wait(self) -> int:
+        """Wait for exit, return exit code."""
+        ...
+
+    async def stop(self, timeout: int = 1) -> None:
+        """Stop the container."""
+        ...
+
+    def read_stderr(self) -> AsyncIterator[bytes]:
+        """Stream stderr for logging."""
+        ...
+
+
+class ContainerRuntime(Protocol):
+    """Protocol for container execution backends."""
+
+    @property
+    def name(self) -> str: ...
+
+    async def ensure_available(self) -> None: ...
+
+    async def run(self, spec: ContainerSpec) -> ContainerHandle: ...
+
+    async def stop(self, name: str, timeout: int = 1) -> None: ...
+
+    async def cleanup_orphans(self, prefix: str) -> list[str]: ...
+
+    async def close(self) -> None: ...
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
 CONTAINER_HOST_GATEWAY: str = "host.docker.internal"
+
+
+# ---------------------------------------------------------------------------
+# Platform helpers
+# ---------------------------------------------------------------------------
 
 
 def _detect_proxy_bind_host() -> str:
     """Detect the appropriate bind host for the credential proxy.
 
-    Docker Desktop (macOS): 127.0.0.1 — the VM routes host.docker.internal to loopback.
+    Docker Desktop (macOS): 127.0.0.1 -- the VM routes host.docker.internal to loopback.
     Docker (Linux): bind to the docker0 bridge IP so only containers can reach it.
     """
     if platform.system() == "Darwin":
         return "127.0.0.1"
 
-    # WSL uses Docker Desktop — loopback is correct
+    # WSL uses Docker Desktop -- loopback is correct
     if Path("/proc/sys/fs/binfmt_misc/WSLInterop").exists():
         return "127.0.0.1"
 
@@ -55,62 +148,37 @@ def _detect_proxy_bind_host() -> str:
 PROXY_BIND_HOST: str = os.environ.get("CREDENTIAL_PROXY_HOST") or _detect_proxy_bind_host()
 
 
-def host_gateway_args() -> list[str]:
-    """CLI args needed for the container to resolve the host gateway."""
+def detect_proxy_bind_host() -> str:
+    """Public API for proxy bind host detection."""
+    return PROXY_BIND_HOST
+
+
+def get_host_gateway_extra_hosts() -> dict[str, str]:
+    """Extra hosts needed for containers to resolve the host gateway."""
     if platform.system() == "Linux":
-        return ["--add-host=host.docker.internal:host-gateway"]
-    return []
+        return {"host.docker.internal": "host-gateway"}
+    return {}
 
 
-def readonly_mount_args(host_path: str, container_path: str) -> list[str]:
-    """Returns CLI args for a readonly bind mount."""
-    return ["-v", f"{host_path}:{container_path}:ro"]
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
 
 
-def stop_container(name: str) -> str:
-    """Returns the shell command to stop a container by name."""
-    return f"{CONTAINER_RUNTIME_BIN} stop -t 1 {name}"
+def get_runtime(runtime_name: str | None = None) -> ContainerRuntime:
+    """Create a ContainerRuntime from name (defaults to CONTAINER_RUNTIME env var)."""
+    from nanoclaw.core.config import CONTAINER_RUNTIME
 
+    name = runtime_name or CONTAINER_RUNTIME
 
-def ensure_container_runtime_running() -> None:
-    """Ensure the container runtime is running."""
-    try:
-        subprocess.run(
-            [CONTAINER_RUNTIME_BIN, "info"],
-            capture_output=True,
-            timeout=10,
-            check=True,
-        )
-        logger.debug("Container runtime already running")
-    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as exc:
-        logger.error("Failed to reach container runtime", error=str(exc))
-        msg = (
-            "\n╔════════════════════════════════════════════════════════════════╗\n"
-            "║  FATAL: Container runtime failed to start                      ║\n"
-            "║                                                                ║\n"
-            "║  Agents cannot run without a container runtime. To fix:        ║\n"
-            "║  1. Ensure Docker is installed and running                     ║\n"
-            "║  2. Run: docker info                                           ║\n"
-            "║  3. Restart NanoClaw                                           ║\n"
-            "╚════════════════════════════════════════════════════════════════╝\n"
-        )
-        raise RuntimeError(msg) from exc
+    if name == "docker":
+        from nanoclaw.container.docker_runtime import DockerRuntime
 
+        return DockerRuntime()
 
-def cleanup_orphans() -> None:
-    """Kill orphaned NanoClaw containers from previous runs."""
-    try:
-        result = subprocess.run(
-            [CONTAINER_RUNTIME_BIN, "ps", "--filter", "name=nanoclaw-", "--format", "{{.Names}}"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        orphans = [name for name in result.stdout.strip().splitlines() if name]
-        for name in orphans:
-            with contextlib.suppress(OSError):
-                subprocess.run(stop_container(name).split(), capture_output=True, check=False)
-        if orphans:
-            logger.info("Stopped orphaned containers", count=len(orphans), names=orphans)
-    except OSError as exc:
-        logger.warning("Failed to clean up orphaned containers", error=str(exc))
+    if name == "k8s":
+        msg = "Kubernetes runtime is not yet implemented"
+        raise NotImplementedError(msg)
+
+    msg = f"Unknown container runtime: {name}"
+    raise ValueError(msg)

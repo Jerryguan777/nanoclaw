@@ -1,29 +1,67 @@
-"""Tests for nanoclaw.container_runtime."""
+"""Tests for nanoclaw.container.runtime -- Protocol types and factory."""
+
+from __future__ import annotations
+
+import pytest
 
 from nanoclaw.container.runtime import (
     CONTAINER_HOST_GATEWAY,
-    CONTAINER_RUNTIME_BIN,
-    host_gateway_args,
-    readonly_mount_args,
-    stop_container,
+    ContainerSpec,
+    VolumeMount,
+    get_host_gateway_extra_hosts,
+    get_runtime,
 )
 
 
-def test_constants() -> None:
-    assert CONTAINER_RUNTIME_BIN == "docker"
+def test_container_host_gateway() -> None:
     assert CONTAINER_HOST_GATEWAY == "host.docker.internal"
 
 
-def test_host_gateway_args() -> None:
-    args = host_gateway_args()
-    assert isinstance(args, list)
+def test_volume_mount_frozen() -> None:
+    m = VolumeMount(host_path="/a", container_path="/b", readonly=True)
+    try:
+        m.host_path = "/c"  # type: ignore[misc]
+        raise AssertionError("Should have raised")
+    except AttributeError:
+        pass
 
 
-def test_readonly_mount_args() -> None:
-    args = readonly_mount_args("/host/path", "/container/path")
-    assert args == ["-v", "/host/path:/container/path:ro"]
+def test_container_spec_defaults() -> None:
+    spec = ContainerSpec(name="test", image="test:latest")
+    assert spec.mounts == []
+    assert spec.env == {}
+    assert spec.user is None
+    assert spec.memory_limit is None
+    assert spec.cpu_limit is None
+    assert spec.extra_hosts == {}
+    assert spec.remove_on_exit is True
+    assert spec.entrypoint is None
 
 
-def test_stop_container() -> None:
-    cmd = stop_container("nanoclaw-test")
-    assert cmd == "docker stop -t 1 nanoclaw-test"
+def test_container_spec_frozen() -> None:
+    spec = ContainerSpec(name="test", image="test:latest")
+    try:
+        spec.name = "other"  # type: ignore[misc]
+        raise AssertionError("Should have raised")
+    except AttributeError:
+        pass
+
+
+def test_get_host_gateway_extra_hosts() -> None:
+    result = get_host_gateway_extra_hosts()
+    assert isinstance(result, dict)
+
+
+def test_get_runtime_docker() -> None:
+    rt = get_runtime("docker")
+    assert rt.name == "docker"
+
+
+def test_get_runtime_k8s_not_implemented() -> None:
+    with pytest.raises(NotImplementedError):
+        get_runtime("k8s")
+
+
+def test_get_runtime_unknown() -> None:
+    with pytest.raises(ValueError, match="Unknown container runtime"):
+        get_runtime("podman")

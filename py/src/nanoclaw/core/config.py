@@ -35,6 +35,7 @@ CONTAINER_MAX_OUTPUT_SIZE: int = int(os.environ.get("CONTAINER_MAX_OUTPUT_SIZE",
 CREDENTIAL_PROXY_PORT: int = int(os.environ.get("CREDENTIAL_PROXY_PORT", "3001"))
 IDLE_TIMEOUT: int = int(os.environ.get("IDLE_TIMEOUT", "1800000"))  # 30 min
 MAX_CONCURRENT_CONTAINERS: int = max(1, int(os.environ.get("MAX_CONCURRENT_CONTAINERS", "5")))
+CONTAINER_RUNTIME: str = os.environ.get("CONTAINER_RUNTIME", "docker")
 
 TRIGGER_PATTERN: re.Pattern[str] = re.compile(
     rf"^@{re.escape(ASSISTANT_NAME)}\b",

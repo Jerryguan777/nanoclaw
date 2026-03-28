@@ -20,6 +20,8 @@ class AgentInitData:
     session_id: str | None = None
     is_scheduled_task: bool = False
     assistant_name: str | None = None
+    system_prompt: str | None = None
+    role_config: dict[str, object] | None = None
 
     def serialize(self) -> bytes:
         return json.dumps(asdict(self)).encode()
@@ -35,4 +37,6 @@ class AgentInitData:
             session_id=raw.get("session_id"),
             is_scheduled_task=raw.get("is_scheduled_task", False),
             assistant_name=raw.get("assistant_name"),
+            system_prompt=raw.get("system_prompt"),
+            role_config=raw.get("role_config"),
         )

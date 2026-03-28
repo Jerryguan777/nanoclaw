@@ -176,34 +176,49 @@ def send_user_message(
 def make_agent_mock(
     response: str = "Hello! I'm Andy, your assistant.",
     session_id: str | None = "session-001",
-) -> Callable[..., Awaitable[object]]:
-    """Mock container agent that returns a canned response."""
-    from nanoclaw.container.runner import ContainerOutput
+) -> object:
+    """Mock agent executor that returns a canned response.
 
-    captured: list[object] = []
+    Returns an object satisfying the AgentExecutor protocol with a ``name``
+    property and an async ``execute`` method.  Also exposes a
+    ``captured_inputs`` list so tests can inspect what was passed in.
+    """
+    from nanoclaw.agent.executor import AgentInput, AgentOutput
 
-    async def mock_run(
-        group: object,
-        inp: object,
-        on_process: Callable[..., None],
-        on_output: Callable[..., Awaitable[None]] | None = None,
-        transport: object | None = None,
-    ) -> ContainerOutput:
-        captured.append(inp)
-        on_process(object(), "mock-container", "test-job")
+    class _FakeHandle:
+        """Minimal stand-in for ContainerHandle."""
 
-        output = ContainerOutput(
-            status="success",
-            result=response,
-            new_session_id=session_id,
-        )
-        if on_output:
-            await on_output(output)
+        name: str = "mock-container"
+        pid: int = 12345
 
-        return ContainerOutput(status="success", result=None, new_session_id=session_id)
+    class MockExecutor:
+        def __init__(self) -> None:
+            self.captured_inputs: list[AgentInput] = []
 
-    mock_run.captured = captured  # type: ignore[attr-defined]
-    return mock_run  # type: ignore[return-value]
+        @property
+        def name(self) -> str:
+            return "mock"
+
+        async def execute(
+            self,
+            inp: AgentInput,
+            on_process: Callable[..., None],
+            on_output: Callable[..., Awaitable[None]] | None = None,
+        ) -> AgentOutput:
+            self.captured_inputs.append(inp)
+            on_process(_FakeHandle(), "mock-container", "test-job")
+
+            output = AgentOutput(
+                status="success",
+                result=response,
+                new_session_id=session_id,
+            )
+            if on_output:
+                await on_output(output)
+
+            return AgentOutput(status="success", result=None, new_session_id=session_id)
+
+    return MockExecutor()
 
 
 # ===========================================================================
@@ -235,10 +250,10 @@ class TestScenarioFirstTimeUser:
         # Mock the container agent
         mock = make_agent_mock(response="Of course! What do you need help with?")
 
-        with patch("nanoclaw.main.run_container_agent", mock):
-            import nanoclaw.main as m
+        import nanoclaw.main as m
 
-            result = await m._process_group_messages(jid)
+        m._executor = mock  # type: ignore[assignment]
+        result = await m._process_group_messages(jid)
 
         assert result is True
         assert len(channel.sent) == 1
@@ -258,10 +273,10 @@ class TestScenarioFirstTimeUser:
         send_user_message(jid, "Remember this context")
         mock = make_agent_mock(response="Noted!", session_id="sess-abc-123")
 
-        with patch("nanoclaw.main.run_container_agent", mock):
-            import nanoclaw.main as m
+        import nanoclaw.main as m
 
-            await m._process_group_messages(jid)
+        m._executor = mock  # type: ignore[assignment]
+        await m._process_group_messages(jid)
 
         assert m._sessions.get("telegram_mygroup") == "sess-abc-123"
 
@@ -316,10 +331,10 @@ class TestScenarioMessageFormatting:
             response="Here's the summary. <internal>I checked CLAUDE.md for context</internal> The project is going well!"
         )
 
-        with patch("nanoclaw.main.run_container_agent", mock):
-            import nanoclaw.main as m
+        import nanoclaw.main as m
 
-            await m._process_group_messages(jid)
+        m._executor = mock  # type: ignore[assignment]
+        await m._process_group_messages(jid)
 
         assert len(channel.sent) == 1
         assert "I checked CLAUDE.md" not in channel.sent[0][1]
@@ -346,14 +361,14 @@ class TestScenarioTriggerPattern:
         send_user_message(jid, "Just chatting among ourselves")
         mock = make_agent_mock()
 
-        with patch("nanoclaw.main.run_container_agent", mock):
-            import nanoclaw.main as m
+        import nanoclaw.main as m
 
-            result = await m._process_group_messages(jid)
+        m._executor = mock  # type: ignore[assignment]
+        result = await m._process_group_messages(jid)
 
         assert result is True
         assert len(channel.sent) == 0  # No response
-        assert len(mock.captured) == 0  # Agent never called
+        assert len(mock.captured_inputs) == 0  # Agent never called
 
     async def test_trigger_activates_agent(self, env: Path) -> None:
         """Message with @Andy in non-main group → agent invoked."""
@@ -371,10 +386,10 @@ class TestScenarioTriggerPattern:
         send_user_message(jid, "@Andy what's the status of the deploy?")
         mock = make_agent_mock(response="Deploy is at 95%, almost done!")
 
-        with patch("nanoclaw.main.run_container_agent", mock):
-            import nanoclaw.main as m
+        import nanoclaw.main as m
 
-            result = await m._process_group_messages(jid)
+        m._executor = mock  # type: ignore[assignment]
+        result = await m._process_group_messages(jid)
 
         assert result is True
         assert len(channel.sent) == 1
@@ -627,7 +642,7 @@ class TestScenarioErrorRecovery:
 
     async def test_error_rolls_back_cursor(self, env: Path) -> None:
         """Container error → message cursor rolled back → retry possible."""
-        from nanoclaw.container.runner import ContainerOutput
+        from nanoclaw.agent.executor import AgentInput, AgentOutput
 
         jid = "tg_group_123@telegram"
         channel = FakeChannel(owned_jids=[jid])
@@ -635,22 +650,30 @@ class TestScenarioErrorRecovery:
 
         send_user_message(jid, "This will crash the agent")
 
-        async def failing_agent(
-            group: object,
-            inp: object,
-            on_process: Callable[..., None],
-            on_output: Callable[..., Awaitable[None]] | None = None,
-            transport: object | None = None,
-        ) -> ContainerOutput:
-            on_process(object(), "crash-container", "test-job")
-            if on_output:
-                await on_output(ContainerOutput(status="error", result=None, error="Segfault"))
-            return ContainerOutput(status="error", result=None, error="Segfault")
+        class _FakeHandle:
+            name: str = "crash-container"
+            pid: int = 99999
 
-        with patch("nanoclaw.main.run_container_agent", failing_agent):
-            import nanoclaw.main as m
+        class FailingExecutor:
+            @property
+            def name(self) -> str:
+                return "mock"
 
-            result = await m._process_group_messages(jid)
+            async def execute(
+                self,
+                inp: AgentInput,
+                on_process: Callable[..., None],
+                on_output: Callable[..., Awaitable[None]] | None = None,
+            ) -> AgentOutput:
+                on_process(_FakeHandle(), "crash-container", "test-job")
+                if on_output:
+                    await on_output(AgentOutput(status="error", result=None, error="Segfault"))
+                return AgentOutput(status="error", result=None, error="Segfault")
+
+        import nanoclaw.main as m
+
+        m._executor = FailingExecutor()  # type: ignore[assignment]
+        result = await m._process_group_messages(jid)
 
         # Error → rollback → retry
         assert result is False
@@ -658,7 +681,7 @@ class TestScenarioErrorRecovery:
 
     async def test_partial_output_prevents_rollback(self, env: Path) -> None:
         """If agent already sent output before error → no rollback (prevent duplicates)."""
-        from nanoclaw.container.runner import ContainerOutput
+        from nanoclaw.agent.executor import AgentInput, AgentOutput
 
         jid = "tg_group_123@telegram"
         channel = FakeChannel(owned_jids=[jid])
@@ -666,31 +689,39 @@ class TestScenarioErrorRecovery:
 
         send_user_message(jid, "Start answering then crash")
 
-        async def partial_then_error(
-            group: object,
-            inp: object,
-            on_process: Callable[..., None],
-            on_output: Callable[..., Awaitable[None]] | None = None,
-            transport: object | None = None,
-        ) -> ContainerOutput:
-            on_process(object(), "partial-container", "test-job")
-            if on_output:
-                # First: send a successful partial output
-                await on_output(
-                    ContainerOutput(
-                        status="success",
-                        result="Here's part of the answer...",
-                        new_session_id=None,
+        class _FakeHandle:
+            name: str = "partial-container"
+            pid: int = 99998
+
+        class PartialThenErrorExecutor:
+            @property
+            def name(self) -> str:
+                return "mock"
+
+            async def execute(
+                self,
+                inp: AgentInput,
+                on_process: Callable[..., None],
+                on_output: Callable[..., Awaitable[None]] | None = None,
+            ) -> AgentOutput:
+                on_process(_FakeHandle(), "partial-container", "test-job")
+                if on_output:
+                    # First: send a successful partial output
+                    await on_output(
+                        AgentOutput(
+                            status="success",
+                            result="Here's part of the answer...",
+                            new_session_id=None,
+                        )
                     )
-                )
-                # Then: error
-                await on_output(ContainerOutput(status="error", result=None, error="Timeout"))
-            return ContainerOutput(status="error", result=None, error="Timeout")
+                    # Then: error
+                    await on_output(AgentOutput(status="error", result=None, error="Timeout"))
+                return AgentOutput(status="error", result=None, error="Timeout")
 
-        with patch("nanoclaw.main.run_container_agent", partial_then_error):
-            import nanoclaw.main as m
+        import nanoclaw.main as m
 
-            result = await m._process_group_messages(jid)
+        m._executor = PartialThenErrorExecutor()  # type: ignore[assignment]
+        result = await m._process_group_messages(jid)
 
         # Partial output was sent → no rollback → returns True
         assert result is True
@@ -905,10 +936,10 @@ class TestScenarioEndToEndFlow:
             session_id="sess-turn-1",
         )
 
-        with patch("nanoclaw.main.run_container_agent", mock1):
-            import nanoclaw.main as m
+        import nanoclaw.main as m
 
-            result1 = await m._process_group_messages(jid)
+        m._executor = mock1  # type: ignore[assignment]
+        result1 = await m._process_group_messages(jid)
 
         assert result1 is True
         assert len(channel.sent) == 1
@@ -931,8 +962,8 @@ class TestScenarioEndToEndFlow:
 
         channel.sent.clear()
 
-        with patch("nanoclaw.main.run_container_agent", mock2):
-            result2 = await m._process_group_messages(jid)
+        m._executor = mock2  # type: ignore[assignment]
+        result2 = await m._process_group_messages(jid)
 
         assert result2 is True
         assert len(channel.sent) == 1
@@ -942,8 +973,8 @@ class TestScenarioEndToEndFlow:
         assert m._sessions.get("telegram_mygroup") == "sess-turn-2"
 
         # Verify the agent received the prompt with message history
-        assert len(mock2.captured) == 1  # type: ignore[attr-defined]
-        inp = mock2.captured[0]  # type: ignore[attr-defined]
+        assert len(mock2.captured_inputs) == 1  # type: ignore[attr-defined]
+        inp = mock2.captured_inputs[0]  # type: ignore[attr-defined]
         assert hasattr(inp, "prompt")
         assert "break that down" in inp.prompt  # type: ignore[union-attr]
 

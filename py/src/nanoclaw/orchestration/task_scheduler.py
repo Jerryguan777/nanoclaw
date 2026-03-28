@@ -16,12 +16,8 @@ if TYPE_CHECKING:
 
 from croniter import croniter
 
-from nanoclaw.container.runner import (
-    ContainerInput,
-    ContainerOutput,
-    run_container_agent,
-    write_tasks_snapshot,
-)
+from nanoclaw.agent import AgentInput, AgentOutput
+from nanoclaw.container.runner import write_tasks_snapshot
 from nanoclaw.core.config import ASSISTANT_NAME, SCHEDULER_POLL_INTERVAL
 from nanoclaw.core.group_folder import resolve_group_folder_path
 from nanoclaw.core.logger import get_logger
@@ -36,8 +32,8 @@ from nanoclaw.db.sqlite import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable
-
+    from nanoclaw.agent.container_executor import ContainerAgentExecutor
+    from nanoclaw.container.runtime import ContainerHandle
     from nanoclaw.container.scheduler import GroupQueue
     from nanoclaw.ipc.nats_transport import NatsTransport
 
@@ -66,12 +62,9 @@ def compute_next_run(task: ScheduledTask) -> str | None:
             ms = 0
 
         if ms <= 0:
-            # Guard against malformed interval that would cause an infinite loop
             logger.warning("Invalid interval value", task_id=task.id, value=task.schedule_value)
             return datetime.fromtimestamp(now + 60.0, tz=UTC).isoformat()
 
-        # Anchor to the scheduled time, not now, to prevent drift.
-        # Skip past any missed intervals so we always land in the future.
         assert task.next_run is not None
         next_ts = datetime.fromisoformat(task.next_run).timestamp() + ms / 1000.0
         while next_ts <= now:
@@ -91,7 +84,7 @@ class SchedulerDependencies(Protocol):
     def on_process(
         self,
         group_jid: str,
-        proc: object,
+        proc: ContainerHandle,
         container_name: str,
         group_folder: str,
         job_id: str | None = None,
@@ -99,6 +92,8 @@ class SchedulerDependencies(Protocol):
     def send_message(self, jid: str, text: str) -> Awaitable[None]: ...
     @property
     def transport(self) -> NatsTransport | None: ...
+    @property
+    def executor(self) -> ContainerAgentExecutor | None: ...
 
 
 _TASK_CLOSE_DELAY_S: float = 10.0
@@ -110,13 +105,11 @@ async def _run_task(
 ) -> None:
     """Run a single scheduled task in a container."""
     start_time = time.monotonic()
-    time.time()
 
     try:
         group_dir = resolve_group_folder_path(task.group_folder)
     except ValueError as exc:
         err_msg = str(exc)
-        # Stop retry churn for malformed legacy rows.
         update_task(task.id, status="paused")
         logger.error("Task has invalid group folder", task_id=task.id, group_folder=task.group_folder, error=err_msg)
         log_task_run(
@@ -152,7 +145,21 @@ async def _run_task(
         )
         return
 
-    # Update tasks snapshot in NATS KV for container to read (Channel 6)
+    executor = deps.executor
+    if executor is None:
+        logger.error("Agent executor not available for task", task_id=task.id)
+        log_task_run(
+            TaskRunLog(
+                task_id=task.id,
+                run_at=datetime.now(UTC).isoformat(),
+                duration_ms=int((time.monotonic() - start_time) * 1000),
+                status="error",
+                result=None,
+                error="Agent executor not initialized",
+            )
+        )
+        return
+
     is_main = group.is_main
     transport = deps.transport
     if transport is not None:
@@ -178,17 +185,15 @@ async def _run_task(
     result: str | None = None
     error: str | None = None
 
-    # For group context mode, use the group's current session
     sessions = deps.get_sessions()
     session_id = sessions.get(task.group_folder) if task.context_mode == "group" else None
 
-    # After the task produces a result, close the container promptly.
     close_handle: asyncio.TimerHandle | None = None
 
     def _schedule_close() -> None:
         nonlocal close_handle
         if close_handle is not None:
-            return  # already scheduled
+            return
         loop = asyncio.get_running_loop()
         close_handle = loop.call_later(
             _TASK_CLOSE_DELAY_S,
@@ -197,7 +202,7 @@ async def _run_task(
 
     try:
 
-        async def _on_output(streamed_output: ContainerOutput) -> None:
+        async def _on_output(streamed_output: AgentOutput) -> None:
             nonlocal result, error
             if streamed_output.result:
                 result = streamed_output.result
@@ -209,9 +214,8 @@ async def _run_task(
             if streamed_output.status == "error":
                 error = streamed_output.error or "Unknown error"
 
-        output = await run_container_agent(
-            group,
-            ContainerInput(
+        output = await executor.execute(
+            AgentInput(
                 prompt=task.prompt,
                 session_id=session_id,
                 group_folder=task.group_folder,
@@ -220,11 +224,10 @@ async def _run_task(
                 is_scheduled_task=True,
                 assistant_name=ASSISTANT_NAME,
             ),
-            lambda proc, container_name, job_id: deps.on_process(
-                task.chat_jid, proc, container_name, task.group_folder, job_id
+            lambda handle, container_name, job_id: deps.on_process(
+                task.chat_jid, handle, container_name, task.group_folder, job_id
             ),
             _on_output,
-            transport=transport,
         )
 
         if close_handle is not None:
@@ -289,7 +292,6 @@ def start_scheduler_loop(deps: SchedulerDependencies) -> asyncio.Task[None]:
                     logger.info("Found due tasks", count=len(due_tasks))
 
                 for task in due_tasks:
-                    # Re-check task status in case it was paused/cancelled
                     current_task = get_task_by_id(task.id)
                     if not current_task or current_task.status != "active":
                         continue

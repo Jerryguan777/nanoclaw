@@ -10,6 +10,7 @@ dependencies = [
     "python-telegram-bot>=22.7",
     "slack-bolt>=1.27.0",
     "nats-py>=2.9",
+    "aiodocker>=0.23",
 ]
 
 [project.scripts]
@@ -60,6 +61,8 @@ omit = [
     "*/nanoclaw/orchestration/remote_control.py",
     "*/nanoclaw/channels/slack.py",
     "*/nanoclaw/channels/telegram.py",
+    "*/nanoclaw/agent/container_executor.py",
+    "*/nanoclaw/container/docker_runtime.py",
 ]
 
 [tool.coverage.report]

@@ -1,1 +1,19 @@
-"""Agent execution layer — placeholder for Step 3."""
+"""Agent execution layer -- protocols, data types, and executor implementations."""
+
+from nanoclaw.agent.executor import (
+    CLAUDE_CODE_BACKEND,
+    PIMONO_BACKEND,
+    AgentBackendConfig,
+    AgentExecutor,
+    AgentInput,
+    AgentOutput,
+)
+
+__all__ = [
+    "CLAUDE_CODE_BACKEND",
+    "PIMONO_BACKEND",
+    "AgentBackendConfig",
+    "AgentExecutor",
+    "AgentInput",
+    "AgentOutput",
+]

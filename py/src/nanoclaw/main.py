@@ -12,17 +12,17 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
+from nanoclaw.agent import CLAUDE_CODE_BACKEND, AgentInput, AgentOutput
+from nanoclaw.agent.container_executor import ContainerAgentExecutor
 from nanoclaw.container.runner import (
-    ContainerInput,
-    ContainerOutput,
-    run_container_agent,
+    AvailableGroup,
     write_groups_snapshot,
     write_tasks_snapshot,
 )
 from nanoclaw.container.runtime import (
     PROXY_BIND_HOST,
-    cleanup_orphans,
-    ensure_container_runtime_running,
+    ContainerHandle,
+    get_runtime,
 )
 from nanoclaw.container.scheduler import GroupQueue
 from nanoclaw.core.config import (
@@ -69,7 +69,7 @@ from nanoclaw.security.sender_allowlist import (
 )
 
 if TYPE_CHECKING:
-    from nanoclaw.container.runner import AvailableGroup
+    from nanoclaw.container.runtime import ContainerRuntime
     from nanoclaw.core.types import Channel, NewMessage, RegisteredGroup
 
 logger = get_logger()
@@ -90,6 +90,8 @@ _message_loop_running: bool = False
 _channels: list[Channel] = []
 _queue: GroupQueue = GroupQueue()
 _transport: NatsTransport | None = None
+_runtime: ContainerRuntime | None = None
+_executor: ContainerAgentExecutor | None = None
 _bg_tasks: set[asyncio.Task[None]] = set()
 
 
@@ -142,12 +144,7 @@ def _register_group(jid: str, group: RegisteredGroup) -> None:
 
 
 def get_available_groups() -> list[AvailableGroup]:
-    """Get available groups list for the agent.
-
-    Returns groups ordered by most recent activity.
-    """
-    from nanoclaw.container.runner import AvailableGroup
-
+    """Get available groups list for the agent."""
     chats = get_all_chats()
     registered_jids = set(_registered_groups.keys())
 
@@ -175,15 +172,9 @@ def _set_registered_groups(groups: dict[str, RegisteredGroup]) -> None:
 
 
 async def _start_nats_ipc_subscriptions(transport: NatsTransport, deps: _IpcDepsImpl) -> list[asyncio.Task[None]]:
-    """Subscribe to NATS subjects for agent IPC messages and tasks.
-
-    Replaces the file-based IPC watcher (start_ipc_watcher).
-    Returns background tasks that should be cancelled on shutdown.
-    """
+    """Subscribe to NATS subjects for agent IPC messages and tasks."""
     tasks: list[asyncio.Task[None]] = []
 
-    # Subscribe to agent messages (Channel 4: agent -> user)
-    # Durable consumer so NATS remembers our position across restarts.
     messages_sub = await transport.js.subscribe("agent.*.messages", durable="orch-messages")
 
     async def _handle_messages() -> None:
@@ -194,9 +185,7 @@ async def _start_nats_ipc_subscriptions(transport: NatsTransport, deps: _IpcDeps
                     chat_jid = data["chatJid"]
                     source_group = data.get("groupFolder", "")
 
-                    # Authorization
                     registered_groups = deps.registered_groups()
-                    # Determine if source is main
                     folder_is_main: dict[str, bool] = {}
                     for group in registered_groups.values():
                         if group.is_main:
@@ -220,7 +209,6 @@ async def _start_nats_ipc_subscriptions(transport: NatsTransport, deps: _IpcDeps
 
     tasks.append(asyncio.create_task(_handle_messages()))
 
-    # Subscribe to agent tasks (Channel 5: agent -> orch)
     tasks_sub = await transport.js.subscribe("agent.*.tasks", durable="orch-tasks")
 
     async def _handle_tasks() -> None:
@@ -229,7 +217,6 @@ async def _start_nats_ipc_subscriptions(transport: NatsTransport, deps: _IpcDeps
                 data = json.loads(msg.data)
                 source_group = data.get("groupFolder", data.get("createdBy", ""))
 
-                # Determine is_main
                 registered_groups = deps.registered_groups()
                 folder_is_main: dict[str, bool] = {}
                 for group in registered_groups.values():
@@ -255,11 +242,7 @@ async def _start_nats_ipc_subscriptions(transport: NatsTransport, deps: _IpcDeps
 
 
 async def _process_group_messages(chat_jid: str) -> bool:
-    """Process all pending messages for a group.
-
-    Called by the GroupQueue when it's this group's turn.
-    Returns True on success, False to signal retry.
-    """
+    """Process all pending messages for a group."""
     global _last_agent_timestamp
 
     group = _registered_groups.get(chat_jid)
@@ -279,7 +262,6 @@ async def _process_group_messages(chat_jid: str) -> bool:
     if not missed_messages:
         return True
 
-    # For non-main groups, check if trigger is required and present
     if not is_main_group and group.requires_trigger is not False:
         allowlist_cfg = load_sender_allowlist()
         has_trigger = any(
@@ -292,14 +274,12 @@ async def _process_group_messages(chat_jid: str) -> bool:
 
     prompt = format_messages(missed_messages, TIMEZONE)
 
-    # Advance cursor; save old cursor for rollback on error
     previous_cursor = _last_agent_timestamp.get(chat_jid, "")
     _last_agent_timestamp[chat_jid] = missed_messages[-1].timestamp
     _save_state()
 
     logger.info("Processing messages", group=group.name, message_count=len(missed_messages))
 
-    # Track idle timer for closing stdin when agent is idle
     idle_handle: asyncio.TimerHandle | None = None
 
     def _reset_idle_timer() -> None:
@@ -312,7 +292,6 @@ async def _process_group_messages(chat_jid: str) -> bool:
             lambda: _queue.close_stdin(chat_jid),
         )
 
-    # Set typing indicator
     if hasattr(channel, "set_typing"):
         try:
             await channel.set_typing(chat_jid, True)
@@ -322,11 +301,10 @@ async def _process_group_messages(chat_jid: str) -> bool:
     had_error = False
     output_sent_to_user = False
 
-    async def _on_output(result: ContainerOutput) -> None:
+    async def _on_output(result: AgentOutput) -> None:
         nonlocal had_error, output_sent_to_user
         if result.result:
             raw = result.result
-            # Strip <internal>...</internal> blocks
             import re
 
             text = re.sub(r"<internal>[\s\S]*?</internal>", "", raw).strip()
@@ -334,7 +312,6 @@ async def _process_group_messages(chat_jid: str) -> bool:
             if text:
                 await channel.send_message(chat_jid, text)
                 output_sent_to_user = True
-            # Only reset idle timer on actual results
             _reset_idle_timer()
         if result.status == "success":
             _queue.notify_idle(chat_jid)
@@ -356,7 +333,6 @@ async def _process_group_messages(chat_jid: str) -> bool:
                 group=group.name,
             )
             return True
-        # Roll back cursor for retry
         _last_agent_timestamp[chat_jid] = previous_cursor
         _save_state()
         logger.warning("Agent error, rolled back message cursor for retry", group=group.name)
@@ -369,13 +345,12 @@ async def _run_agent(
     group: RegisteredGroup,
     prompt: str,
     chat_jid: str,
-    on_output: Callable[[ContainerOutput], Awaitable[None]] | None = None,
+    on_output: Callable[[AgentOutput], Awaitable[None]] | None = None,
 ) -> str:
     """Run agent in a container. Returns 'success' or 'error'."""
     is_main = group.is_main
     session_id = _sessions.get(group.folder)
 
-    # Update snapshots in NATS KV for container to read (Channel 6)
     if _transport is not None:
         tasks = get_all_tasks()
         await write_tasks_snapshot(
@@ -405,12 +380,15 @@ async def _run_agent(
             set(_registered_groups.keys()),
         )
 
-    # Wrap on_output to track session ID from streamed results
+    if _executor is None:
+        logger.error("Agent executor not initialized")
+        return "error"
+
     wrapped_on_output = None
     if on_output is not None:
         original_on_output = on_output
 
-        async def _wrapped(output: ContainerOutput) -> None:
+        async def _wrapped(output: AgentOutput) -> None:
             if output.new_session_id:
                 _sessions[group.folder] = output.new_session_id
                 set_session(group.folder, output.new_session_id)
@@ -419,9 +397,8 @@ async def _run_agent(
         wrapped_on_output = _wrapped
 
     try:
-        output = await run_container_agent(
-            group,
-            ContainerInput(
+        output = await _executor.execute(
+            AgentInput(
                 prompt=prompt,
                 session_id=session_id,
                 group_folder=group.folder,
@@ -429,11 +406,10 @@ async def _run_agent(
                 is_main=is_main,
                 assistant_name=ASSISTANT_NAME,
             ),
-            lambda proc, container_name, job_id: _queue.register_process(
-                chat_jid, proc, container_name, group.folder, job_id
+            lambda handle, container_name, job_id: _queue.register_process(
+                chat_jid, handle, container_name, group.folder, job_id
             ),
             wrapped_on_output,
-            transport=_transport,
         )
 
         if output.new_session_id:
@@ -474,11 +450,9 @@ async def _message_loop(shutdown_event: asyncio.Event) -> None:
             if messages:
                 logger.info("New messages", count=len(messages))
 
-                # Advance the "seen" cursor for all messages immediately
                 _last_timestamp = new_timestamp
                 _save_state()
 
-                # Deduplicate by group
                 messages_by_group: dict[str, list[NewMessage]] = {}
                 for msg in messages:
                     messages_by_group.setdefault(msg.chat_jid, []).append(msg)
@@ -506,7 +480,6 @@ async def _message_loop(shutdown_event: asyncio.Event) -> None:
                         if not has_trigger:
                             continue
 
-                    # Pull all messages since lastAgentTimestamp
                     all_pending = get_messages_since(
                         chat_jid,
                         _last_agent_timestamp.get(chat_jid, ""),
@@ -521,30 +494,25 @@ async def _message_loop(shutdown_event: asyncio.Event) -> None:
                         )
                         _last_agent_timestamp[chat_jid] = messages_to_send[-1].timestamp
                         _save_state()
-                        # Show typing indicator
                         if hasattr(channel, "set_typing"):
                             try:
                                 await channel.set_typing(chat_jid, True)
                             except (OSError, RuntimeError, TypeError, ValueError):
                                 logger.warning("Failed to set typing indicator", chat_jid=chat_jid)
                     else:
-                        # No active container - enqueue for a new one
                         _queue.enqueue_message_check(chat_jid)
         except (OSError, RuntimeError, TypeError, ValueError):
             logger.exception("Error in message loop")
 
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=POLL_INTERVAL)
-            break  # shutdown_event was set
+            break
         except TimeoutError:
             pass
 
 
 def _recover_pending_messages() -> None:
-    """Startup recovery: check for unprocessed messages in registered groups.
-
-    Handles crash between advancing lastTimestamp and processing messages.
-    """
+    """Startup recovery: check for unprocessed messages in registered groups."""
     for chat_jid, group in _registered_groups.items():
         since_timestamp = _last_agent_timestamp.get(chat_jid, "")
         pending = get_messages_since(chat_jid, since_timestamp, ASSISTANT_NAME)
@@ -553,10 +521,12 @@ def _recover_pending_messages() -> None:
             _queue.enqueue_message_check(chat_jid)
 
 
-def _ensure_container_system_running() -> None:
+async def _ensure_container_system_running() -> None:
     """Ensure the container runtime is running and clean up orphans."""
-    ensure_container_runtime_running()
-    cleanup_orphans()
+    global _runtime
+    _runtime = get_runtime()
+    await _runtime.ensure_available()
+    await _runtime.cleanup_orphans("nanoclaw-")
 
 
 # ---------------------------------------------------------------------------
@@ -598,33 +568,37 @@ async def _handle_remote_control(command: str, chat_jid: str, msg: NewMessage) -
 
 async def main() -> None:
     """Entry point for the NanoClaw orchestrator."""
-    global _transport, _queue
+    global _transport, _queue, _runtime, _executor
 
-    _ensure_container_system_running()
+    await _ensure_container_system_running()
     init_database()
     logger.info("Database initialized")
     _load_state()
     restore_remote_control()
 
-    # Connect to NATS for IPC
     _transport = NatsTransport(NATS_URL)
     try:
         await _transport.connect()
     except ConnectionError:
         logger.critical(
-            "Failed to connect to NATS — is it running?",
+            "Failed to connect to NATS -- is it running?",
             url=NATS_URL,
             hint="docker compose -f docker-compose.dev.yml up -d",
         )
         sys.exit(1)
 
-    # Create queue with transport
-    _queue = GroupQueue(transport=_transport)
+    assert _runtime is not None
+    _executor = ContainerAgentExecutor(
+        CLAUDE_CODE_BACKEND,
+        _runtime,
+        _transport,
+        lambda: _registered_groups,
+    )
 
-    # Start credential proxy (containers route API calls through this)
+    _queue = GroupQueue(transport=_transport, runtime=_runtime)
+
     proxy_runner = await start_credential_proxy(CREDENTIAL_PROXY_PORT, PROXY_BIND_HOST)
 
-    # Graceful shutdown
     shutdown_event = asyncio.Event()
 
     def _signal_handler(sig_name: str) -> None:
@@ -635,7 +609,6 @@ async def main() -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, _signal_handler, sig.name)
 
-    # Import channel registry (triggers self-registration)
     import nanoclaw.channels  # noqa: F401
     from nanoclaw.channels.registry import (
         ChannelOpts,
@@ -643,7 +616,6 @@ async def main() -> None:
         get_registered_channel_names,
     )
 
-    # Channel callbacks (shared by all channels)
     def _on_message(chat_jid: str, msg: NewMessage) -> None:
         trimmed = msg.content.strip()
         if trimmed in ("/remote-control", "/remote-control-end"):
@@ -656,7 +628,6 @@ async def main() -> None:
             )
             return
 
-        # Sender allowlist drop mode
         if not msg.is_from_me and not msg.is_bot_message and chat_jid in _registered_groups:
             cfg = load_sender_allowlist()
             if should_drop_message(chat_jid, cfg) and not is_sender_allowed(chat_jid, msg.sender, cfg):
@@ -672,7 +643,6 @@ async def main() -> None:
         registered_groups=lambda: _registered_groups,
     )
 
-    # Create and connect all registered channels
     for channel_name in get_registered_channel_names():
         factory = get_channel_factory(channel_name)
         if factory is None:
@@ -691,20 +661,16 @@ async def main() -> None:
         logger.critical("No channels connected")
         sys.exit(1)
 
-    # Start subsystems
     start_scheduler_loop(_SchedulerDepsImpl())
 
-    # Start NATS IPC subscriptions (replaces file-based IPC watcher)
     ipc_deps = _IpcDepsImpl()
     ipc_tasks = await _start_nats_ipc_subscriptions(_transport, ipc_deps)
 
     _queue.set_process_messages_fn(_process_group_messages)
     _recover_pending_messages()
 
-    # Run message loop until shutdown
     await _message_loop(shutdown_event)
 
-    # Cleanup
     for t in ipc_tasks:
         t.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -715,6 +681,7 @@ async def main() -> None:
     for ch in _channels:
         await ch.disconnect()
     await _transport.close()
+    await _runtime.close()
 
 
 # ---------------------------------------------------------------------------
@@ -738,7 +705,7 @@ class _SchedulerDepsImpl:
     def on_process(
         self,
         group_jid: str,
-        proc: object,
+        proc: ContainerHandle,
         container_name: str,
         group_folder: str,
         job_id: str | None = None,
@@ -748,6 +715,10 @@ class _SchedulerDepsImpl:
     @property
     def transport(self) -> NatsTransport | None:
         return _transport
+
+    @property
+    def executor(self) -> ContainerAgentExecutor | None:
+        return _executor
 
     async def send_message(self, jid: str, raw_text: str) -> None:
         channel = find_channel(_channels, jid)
