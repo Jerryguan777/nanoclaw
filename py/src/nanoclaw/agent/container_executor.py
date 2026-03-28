@@ -227,8 +227,8 @@ class ContainerAgentExecutor:
                         )
                     else:
                         stderr_buf += chunk
-            except (OSError, RuntimeError):
-                pass
+            except (OSError, RuntimeError) as err:
+                logger.debug("Stderr read stopped", error=str(err))
 
         # Run readers concurrently
         tasks: list[asyncio.Task[None]] = [asyncio.create_task(_read_stderr())]

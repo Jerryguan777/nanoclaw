@@ -1,5 +1,6 @@
 """Agent execution layer -- protocols, data types, and executor implementations."""
 
+from nanoclaw.agent.container_executor import ContainerAgentExecutor
 from nanoclaw.agent.executor import (
     CLAUDE_CODE_BACKEND,
     PIMONO_BACKEND,
@@ -16,4 +17,5 @@ __all__ = [
     "AgentExecutor",
     "AgentInput",
     "AgentOutput",
+    "ContainerAgentExecutor",
 ]

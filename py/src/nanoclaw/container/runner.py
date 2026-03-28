@@ -72,9 +72,9 @@ def build_volume_mounts(
     is_main: bool,
     backend_config: AgentBackendConfig | None = None,
 ) -> list[VolumeMount]:
-    """Build the list of volume mounts for a container invocation.
+    """Build volume mounts for a container invocation.
 
-    This is a pure computation function (synchronous).
+    Note: creates group session directory and default settings if missing.
     """
     mounts: list[VolumeMount] = []
     project_root = PROJECT_ROOT

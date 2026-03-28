@@ -12,8 +12,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
-from nanoclaw.agent import CLAUDE_CODE_BACKEND, AgentInput, AgentOutput
-from nanoclaw.agent.container_executor import ContainerAgentExecutor
+from nanoclaw.agent import CLAUDE_CODE_BACKEND, AgentInput, AgentOutput, ContainerAgentExecutor
 from nanoclaw.container.runner import (
     AvailableGroup,
     write_groups_snapshot,
