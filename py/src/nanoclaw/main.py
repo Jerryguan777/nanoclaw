@@ -482,8 +482,13 @@ async def _start_nats_ipc_subscriptions(transport: NatsTransport, deps: _IpcDeps
                     source_group = data.get("groupFolder", "")
                     source_coworker_id = data.get("coworkerId", "")
 
-                    # Find source coworker
-                    source_cw = _state.coworkers.get(source_coworker_id)
+                    # Find source coworker (by ID, or fallback to folder lookup)
+                    source_cw = _state.coworkers.get(source_coworker_id) if source_coworker_id else None
+                    if source_cw is None and source_group:
+                        for tenant in _state.tenants.values():
+                            source_cw = _state.get_coworker_by_folder(tenant.id, source_group)
+                            if source_cw:
+                                break
                     is_main = source_cw.config.is_admin if source_cw else False
 
                     # Authorization: admin can send anywhere, others only to own conversations
@@ -520,8 +525,14 @@ async def _start_nats_ipc_subscriptions(transport: NatsTransport, deps: _IpcDeps
                 source_tenant_id = data.get("tenantId", DEFAULT_TENANT)
                 source_coworker_id = data.get("coworkerId", "")
 
-                # Determine is_main from coworker state
-                source_cw = _state.coworkers.get(source_coworker_id)
+                # Determine is_main from coworker state (fallback to folder lookup)
+                source_cw = _state.coworkers.get(source_coworker_id) if source_coworker_id else None
+                if source_cw is None and source_group:
+                    for tenant in _state.tenants.values():
+                        source_cw = _state.get_coworker_by_folder(tenant.id, source_group)
+                        if source_cw:
+                            source_coworker_id = source_cw.config.id
+                            break
                 is_main = source_cw.config.is_admin if source_cw else False
 
                 await process_task_ipc(
