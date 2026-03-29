@@ -189,15 +189,23 @@ async def migrate_to_multi_tenant() -> None:
             logger.info("Migrated session", folder=p.folder, session_id=p.old_session[:30])
 
         # ---- Phase 5: Copy filesystem ----
-        old_dir = GROUPS_DIR / p.folder
-        new_workspace = DATA_DIR / "tenants" / tenant.id / "coworkers" / p.folder / "workspace"
+        coworker_base = DATA_DIR / "tenants" / tenant.id / "coworkers" / p.folder
 
+        # 5a: groups/{folder}/ → coworkers/{folder}/workspace/
+        old_dir = GROUPS_DIR / p.folder
+        new_workspace = coworker_base / "workspace"
         if old_dir.exists() and not new_workspace.exists():
             new_workspace.parent.mkdir(parents=True, exist_ok=True)
             shutil.copytree(str(old_dir), str(new_workspace), dirs_exist_ok=True)
-            logger.info("Migrated filesystem", old=str(old_dir), new=str(new_workspace))
-        elif new_workspace.exists():
-            logger.info("Workspace already exists, skipping filesystem migration", folder=p.folder)
+            logger.info("Migrated workspace", old=str(old_dir), new=str(new_workspace))
+
+        # 5b: data/sessions/{folder}/.claude/ → coworkers/{folder}/.claude/
+        old_claude = DATA_DIR / "sessions" / p.folder / ".claude"
+        new_claude = coworker_base / ".claude"
+        if old_claude.exists():
+            new_claude.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(str(old_claude), str(new_claude), dirs_exist_ok=True)
+            logger.info("Migrated .claude session", old=str(old_claude), new=str(new_claude))
 
     logger.info("Migration complete", groups_migrated=len(pending), tenant_id=tenant.id)
 
