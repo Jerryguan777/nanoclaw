@@ -7,13 +7,14 @@ Self-registers via registerChannel() on import.
 from __future__ import annotations
 
 import os
+import re
 from typing import Any
 
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 
 from nanoclaw.channels.registry import ChannelOpts, register_channel
-from nanoclaw.core.config import ASSISTANT_NAME, TRIGGER_PATTERN
+from nanoclaw.core.config import ASSISTANT_NAME
 from nanoclaw.core.env import read_env_file
 from nanoclaw.core.logger import get_logger
 from nanoclaw.core.types import NewMessage
@@ -23,6 +24,12 @@ logger = get_logger()
 
 # Slack message length limit
 _MAX_MESSAGE_LENGTH = 4000
+
+# Legacy trigger pattern derived from ASSISTANT_NAME
+_TRIGGER_PATTERN: re.Pattern[str] = re.compile(
+    rf"^@{re.escape(ASSISTANT_NAME)}\b",
+    re.IGNORECASE,
+)
 
 
 class SlackChannel:
@@ -85,7 +92,7 @@ class SlackChannel:
             content = text
             if self._bot_user_id and not is_bot:
                 mention = f"<@{self._bot_user_id}>"
-                if mention in content and not TRIGGER_PATTERN.search(content):
+                if mention in content and not _TRIGGER_PATTERN.search(content):
                     content = f"@{ASSISTANT_NAME} {content}"
 
             self._opts.on_message(

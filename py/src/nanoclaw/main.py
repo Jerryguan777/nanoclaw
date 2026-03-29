@@ -1,4 +1,8 @@
-"""Main orchestrator -- state management, message loop, agent invocation."""
+"""Main orchestrator -- state management, message loop, agent invocation.
+
+Multi-tenant architecture: OrchestratorState replaces module-level globals.
+Routing: binding_id -> conversation -> coworker.
+"""
 
 from __future__ import annotations
 
@@ -12,7 +16,11 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
+    from nanoclaw.channels.gateway import ChannelGateway
+
 from nanoclaw.agent import CLAUDE_CODE_BACKEND, AgentInput, AgentOutput, ContainerAgentExecutor
+from nanoclaw.channels.slack_gateway import SlackGateway
+from nanoclaw.channels.telegram_gateway import TelegramGateway
 from nanoclaw.container.runner import (
     AvailableGroup,
     write_groups_snapshot,
@@ -27,29 +35,44 @@ from nanoclaw.container.scheduler import GroupQueue
 from nanoclaw.core.config import (
     ASSISTANT_NAME,
     CREDENTIAL_PROXY_PORT,
+    GLOBAL_MAX_CONTAINERS,
     IDLE_TIMEOUT,
     NATS_URL,
     POLL_INTERVAL,
     TIMEZONE,
-    TRIGGER_PATTERN,
 )
-from nanoclaw.core.group_folder import resolve_group_folder_path
 from nanoclaw.core.logger import get_logger
+from nanoclaw.core.orchestrator_state import (
+    ConversationState,
+    CoworkerConfig,
+    CoworkerState,
+    OrchestratorState,
+)
+from nanoclaw.core.types import ChannelBinding, Conversation, Coworker
 from nanoclaw.db.pg import (
+    DEFAULT_TENANT,
     close_database,
+    create_conversation,
+    create_role,
+    create_tenant,
+    get_all_channel_bindings,
     get_all_chats,
-    get_all_registered_groups,
+    get_all_conversations,
+    get_all_coworkers,
     get_all_sessions,
     get_all_tasks,
     get_messages_since,
-    get_new_messages,
-    get_router_state,
+    get_new_messages_for_conversations,
+    get_roles_for_tenant,
+    get_tenant_by_slug,
     init_database,
-    set_registered_group,
-    set_router_state,
     set_session,
     store_chat_metadata,
-    store_message,
+    update_conversation_last_invocation,
+    update_tenant_message_cursor,
+)
+from nanoclaw.db.pg import (
+    store_message as db_store_message,
 )
 from nanoclaw.ipc.nats_transport import NatsTransport
 from nanoclaw.ipc.task_handler import process_task_ipc
@@ -58,7 +81,7 @@ from nanoclaw.orchestration.remote_control import (
     start_remote_control,
     stop_remote_control,
 )
-from nanoclaw.orchestration.router import find_channel, format_messages, format_outbound
+from nanoclaw.orchestration.router import format_messages, format_outbound
 from nanoclaw.orchestration.task_scheduler import start_scheduler_loop
 from nanoclaw.security.credential_proxy import start_credential_proxy
 from nanoclaw.security.sender_allowlist import (
@@ -70,24 +93,19 @@ from nanoclaw.security.sender_allowlist import (
 
 if TYPE_CHECKING:
     from nanoclaw.container.runtime import ContainerRuntime
-    from nanoclaw.core.types import Channel, NewMessage, RegisteredGroup
 
 logger = get_logger()
 
-# Re-export for backwards compatibility during refactor
 __all__ = ["main", "main_sync"]
 
 # ---------------------------------------------------------------------------
-# Module-level state
+# Module-level runtime objects (not state — those are in OrchestratorState)
 # ---------------------------------------------------------------------------
 
-_last_timestamp: str = ""
-_sessions: dict[str, str] = {}
-_registered_groups: dict[str, RegisteredGroup] = {}
-_last_agent_timestamp: dict[str, str] = {}
+_state: OrchestratorState = OrchestratorState(global_limit=GLOBAL_MAX_CONTAINERS)
 _message_loop_running: bool = False
 
-_channels: list[Channel] = []
+_gateways: dict[str, ChannelGateway] = {}
 _queue: GroupQueue = GroupQueue()
 _transport: NatsTransport | None = None
 _runtime: ContainerRuntime | None = None
@@ -96,78 +114,351 @@ _bg_tasks: set[asyncio.Task[None]] = set()
 
 
 # ---------------------------------------------------------------------------
-# State persistence
+# State loading
 # ---------------------------------------------------------------------------
 
 
 async def _load_state() -> None:
-    """Load persisted state from the database."""
-    global _last_timestamp, _sessions, _registered_groups, _last_agent_timestamp
+    """Load all multi-tenant state from the database into OrchestratorState."""
+    global _state
+    _state = OrchestratorState(global_limit=GLOBAL_MAX_CONTAINERS)
 
-    _last_timestamp = await get_router_state("last_timestamp") or ""
-    agent_ts = await get_router_state("last_agent_timestamp")
-    try:
-        _last_agent_timestamp = json.loads(agent_ts) if agent_ts else {}
-    except (json.JSONDecodeError, TypeError):
-        logger.warning("Corrupted last_agent_timestamp in DB, resetting")
-        _last_agent_timestamp = {}
-    _sessions = await get_all_sessions()
-    _registered_groups = await get_all_registered_groups()
-    logger.info("State loaded", group_count=len(_registered_groups))
+    # Ensure default tenant exists
+    tenant = await get_tenant_by_slug("default")
+    if tenant is None:
+        tenant = await create_tenant(name="Default Tenant", slug="default")
+        # Create default role
+        await create_role(tenant_id=tenant.id, name="general")
+        logger.info("Created default tenant and role", tenant_id=tenant.id)
 
+    _state.tenants[tenant.id] = tenant
 
-async def _save_state() -> None:
-    """Persist state to the database."""
-    await set_router_state("last_timestamp", _last_timestamp)
-    await set_router_state("last_agent_timestamp", json.dumps(_last_agent_timestamp))
+    # Load all coworkers
+    all_coworkers = await get_all_coworkers()
+    all_bindings = await get_all_channel_bindings()
+    all_conversations = await get_all_conversations()
+    all_sessions = await get_all_sessions()
+
+    # Load roles for building CoworkerConfig
+    roles_by_id: dict[str, object] = {}
+    for t in _state.tenants.values():
+        for r in await get_roles_for_tenant(t.id):
+            roles_by_id[r.id] = r
+
+    # Index bindings and conversations
+    bindings_by_coworker: dict[str, list[ChannelBinding]] = {}
+    for b in all_bindings:
+        bindings_by_coworker.setdefault(b.coworker_id, []).append(b)
+
+    convs_by_coworker: dict[str, list[Conversation]] = {}
+    for c in all_conversations:
+        convs_by_coworker.setdefault(c.coworker_id, []).append(c)
+
+    for cw in all_coworkers:
+        role = roles_by_id.get(cw.role_id)
+        config = CoworkerConfig(
+            id=cw.id,
+            tenant_id=cw.tenant_id,
+            name=cw.name,
+            folder=cw.folder,
+            system_prompt=getattr(role, "system_prompt", None) if role else None,
+            trigger_pattern=CoworkerConfig.build_trigger_pattern(cw.name),
+            agent_backend=getattr(role, "agent_backend", "claude-code") if role else "claude-code",
+            container_image=None,
+            max_concurrent=cw.max_concurrent,
+            tools=getattr(role, "tools", []) if role else [],
+            skills=getattr(role, "skills", []) if role else [],
+            is_admin=cw.is_admin,
+        )
+
+        cw_state = CoworkerState(config=config)
+
+        # Load channel bindings
+        for b in bindings_by_coworker.get(cw.id, []):
+            cw_state.channel_bindings[b.channel_type] = b
+
+        # Load conversations
+        for conv in convs_by_coworker.get(cw.id, []):
+            session_id = all_sessions.get(conv.id)
+            cw_state.conversations[conv.channel_chat_id] = ConversationState(
+                conversation=conv,
+                session_id=session_id,
+                last_agent_timestamp=conv.last_agent_invocation or "",
+            )
+
+        _state.coworkers[cw.id] = cw_state
+
+    logger.info(
+        "State loaded",
+        tenant_count=len(_state.tenants),
+        coworker_count=len(_state.coworkers),
+    )
 
 
 # ---------------------------------------------------------------------------
-# Group management
+# Message handling callback (from gateways)
 # ---------------------------------------------------------------------------
 
 
-async def _register_group(jid: str, group: RegisteredGroup) -> None:
-    """Register a new group and persist it."""
-    try:
-        group_dir = resolve_group_folder_path(group.folder)
-    except ValueError:
-        logger.warning("Rejecting group registration with invalid folder", jid=jid, folder=group.folder)
+async def _handle_incoming(
+    binding_id: str,
+    chat_id: str,
+    sender: str,
+    sender_name: str,
+    text: str,
+    timestamp: str,
+    msg_id: str,
+    is_group: bool,
+) -> None:
+    """Unified message handler for all channel gateways."""
+    # Store chat metadata (legacy)
+    jid_prefix = ""
+    for gw in _gateways.values():
+        if hasattr(gw, "_bots") and binding_id in getattr(gw, "_bots", {}):
+            jid_prefix = "tg:"
+        elif hasattr(gw, "_apps") and binding_id in getattr(gw, "_apps", {}):
+            jid_prefix = "slack:"
+    await store_chat_metadata(
+        f"{jid_prefix}{chat_id}", timestamp, sender_name, jid_prefix.rstrip(":") or None, is_group
+    )
+
+    # Find conversation
+    result = _state.find_conversation_by_binding_and_chat(binding_id, chat_id)
+    if not result:
         return
 
-    _registered_groups[jid] = group
-    await set_registered_group(jid, group)
+    _cw_state, conv_state = result
+    conv = conv_state.conversation
 
-    # Create group folder
-    (group_dir / "logs").mkdir(parents=True, exist_ok=True)
-    logger.info("Group registered", jid=jid, name=group.name, folder=group.folder)
+    # Sender allowlist check
+    cfg = load_sender_allowlist()
+    full_jid = f"{jid_prefix}{chat_id}"
+    if should_drop_message(full_jid, cfg) and not is_sender_allowed(full_jid, sender, cfg):
+        if cfg.log_denied:
+            logger.debug("sender-allowlist: dropping message (drop mode)", chat_id=chat_id, sender=sender)
+        return
 
-
-async def get_available_groups() -> list[AvailableGroup]:
-    """Get available groups list for the agent."""
-    chats = await get_all_chats()
-    registered_jids = set(_registered_groups.keys())
-
-    return [
-        AvailableGroup(
-            jid=c.jid,
-            name=c.name,
-            last_activity=c.last_message_time,
-            is_registered=c.jid in registered_jids,
-        )
-        for c in chats
-        if c.jid != "__group_sync__" and c.is_group
-    ]
-
-
-def _set_registered_groups(groups: dict[str, RegisteredGroup]) -> None:
-    """Set registered groups (for testing)."""
-    global _registered_groups
-    _registered_groups = groups
+    # Store message
+    await db_store_message(
+        tenant_id=conv.tenant_id,
+        conversation_id=conv.id,
+        msg_id=msg_id,
+        sender=sender,
+        sender_name=sender_name,
+        content=text,
+        timestamp=timestamp,
+    )
 
 
 # ---------------------------------------------------------------------------
-# NATS subscription handlers (replace file-based IPC watcher)
+# Message processing
+# ---------------------------------------------------------------------------
+
+
+async def _process_conversation_messages(chat_id: str) -> bool:
+    """Process all pending messages for a conversation (identified by chat_id)."""
+    # Find the conversation
+    found = None
+    for cw in _state.coworkers.values():
+        conv_state = cw.conversations.get(chat_id)
+        if conv_state:
+            found = (cw, conv_state)
+            break
+
+    if not found:
+        return True
+
+    cw_state, conv_state = found
+    conv = conv_state.conversation
+    config = cw_state.config
+
+    since_timestamp = conv_state.last_agent_timestamp
+    missed_messages = await get_messages_since(
+        conv.tenant_id, conv.id, since_timestamp, config.name, chat_jid=conv.channel_chat_id
+    )
+
+    if not missed_messages:
+        return True
+
+    is_admin = config.is_admin
+
+    if not is_admin and conv.requires_trigger:
+        allowlist_cfg = load_sender_allowlist()
+        has_trigger = any(
+            config.trigger_pattern.search(m.content.strip())
+            and (m.is_from_me or is_trigger_allowed(conv.channel_chat_id, m.sender, allowlist_cfg))
+            for m in missed_messages
+        )
+        if not has_trigger:
+            return True
+
+    prompt = format_messages(missed_messages, TIMEZONE)
+
+    previous_cursor = conv_state.last_agent_timestamp
+    conv_state.last_agent_timestamp = missed_messages[-1].timestamp
+    await update_conversation_last_invocation(conv.id, missed_messages[-1].timestamp)
+
+    logger.info("Processing messages", coworker=config.name, message_count=len(missed_messages))
+
+    idle_handle: asyncio.TimerHandle | None = None
+
+    def _reset_idle_timer() -> None:
+        nonlocal idle_handle
+        if idle_handle is not None:
+            idle_handle.cancel()
+        loop = asyncio.get_running_loop()
+        idle_handle = loop.call_later(
+            IDLE_TIMEOUT / 1000.0,
+            lambda: _queue.close_stdin(chat_id),
+        )
+
+    # Set typing
+    binding = cw_state.channel_bindings.get(_get_channel_type_for_chat(conv.channel_chat_id))
+    if binding:
+        gw = _gateways.get(_get_channel_type_for_chat(conv.channel_chat_id))
+        if gw:
+            with contextlib.suppress(OSError, RuntimeError, TypeError, ValueError):
+                await gw.set_typing(binding.id, conv.channel_chat_id, True)
+
+    had_error = False
+    output_sent_to_user = False
+
+    async def _on_output(result: AgentOutput) -> None:
+        nonlocal had_error, output_sent_to_user
+        if result.result:
+            import re
+
+            raw = result.result
+            text = re.sub(r"<internal>[\s\S]*?</internal>", "", raw).strip()
+            logger.info("Agent output", coworker=config.name, chars=len(raw))
+            if text and binding:
+                gw = _gateways.get(_get_channel_type_for_chat(conv.channel_chat_id))
+                if gw:
+                    await gw.send_message(binding.id, conv.channel_chat_id, text)
+                    output_sent_to_user = True
+            _reset_idle_timer()
+        if result.status == "success":
+            _queue.notify_idle(chat_id)
+        if result.status == "error":
+            had_error = True
+
+    output = await _run_agent(cw_state, conv_state, prompt, _on_output)
+
+    # Stop typing
+    if binding:
+        gw = _gateways.get(_get_channel_type_for_chat(conv.channel_chat_id))
+        if gw:
+            with contextlib.suppress(OSError, RuntimeError, TypeError, ValueError):
+                await gw.set_typing(binding.id, conv.channel_chat_id, False)
+    if idle_handle is not None:
+        idle_handle.cancel()
+
+    if output == "error" or had_error:
+        if output_sent_to_user:
+            logger.warning(
+                "Agent error after output was sent, skipping cursor rollback",
+                coworker=config.name,
+            )
+            return True
+        conv_state.last_agent_timestamp = previous_cursor
+        await update_conversation_last_invocation(conv.id, previous_cursor)
+        logger.warning("Agent error, rolled back message cursor for retry", coworker=config.name)
+        return False
+
+    return True
+
+
+def _get_channel_type_for_chat(chat_id: str) -> str:
+    """Infer channel type from chat ID format."""
+    if chat_id.startswith("C") or chat_id.startswith("D"):
+        return "slack"
+    return "telegram"
+
+
+async def _run_agent(
+    cw_state: CoworkerState,
+    conv_state: ConversationState,
+    prompt: str,
+    on_output: Callable[[AgentOutput], Awaitable[None]] | None = None,
+) -> str:
+    """Run agent in a container. Returns 'success' or 'error'."""
+    config = cw_state.config
+    conv = conv_state.conversation
+    is_main = config.is_admin
+    session_id = conv_state.session_id
+
+    if _transport is not None:
+        tasks = await get_all_tasks(config.tenant_id)
+        await write_tasks_snapshot(
+            _transport,
+            config.tenant_id,
+            config.folder,
+            is_main,
+            [
+                {
+                    "id": t.id,
+                    "coworkerFolder": config.folder,
+                    "prompt": t.prompt,
+                    "schedule_type": t.schedule_type,
+                    "schedule_value": t.schedule_value,
+                    "status": t.status,
+                    "next_run": t.next_run,
+                }
+                for t in tasks
+            ],
+        )
+
+    if _executor is None:
+        logger.error("Agent executor not initialized")
+        return "error"
+
+    wrapped_on_output = None
+    if on_output is not None:
+        original_on_output = on_output
+
+        async def _wrapped(output: AgentOutput) -> None:
+            if output.new_session_id:
+                conv_state.session_id = output.new_session_id
+                await set_session(conv.id, conv.tenant_id, conv.coworker_id, output.new_session_id)
+            await original_on_output(output)
+
+        wrapped_on_output = _wrapped
+
+    try:
+        output = await _executor.execute(
+            AgentInput(
+                prompt=prompt,
+                session_id=session_id,
+                group_folder=config.folder,
+                chat_jid=conv.channel_chat_id,
+                is_main=is_main,
+                assistant_name=config.name,
+                tenant_id=config.tenant_id,
+                coworker_id=config.id,
+                conversation_id=conv.id,
+            ),
+            lambda handle, container_name, job_id: _queue.register_process(
+                conv.channel_chat_id, handle, container_name, config.folder, job_id
+            ),
+            wrapped_on_output,
+        )
+
+        if output.new_session_id:
+            conv_state.session_id = output.new_session_id
+            await set_session(conv.id, conv.tenant_id, conv.coworker_id, output.new_session_id)
+
+        if output.status == "error":
+            logger.error("Container agent error", coworker=config.name, error=output.error)
+            return "error"
+
+        return "success"
+    except (OSError, RuntimeError, TypeError, ValueError):
+        logger.exception("Agent error", coworker=config.name)
+        return "error"
+
+
+# ---------------------------------------------------------------------------
+# NATS IPC subscriptions
 # ---------------------------------------------------------------------------
 
 
@@ -184,17 +475,22 @@ async def _start_nats_ipc_subscriptions(transport: NatsTransport, deps: _IpcDeps
                 if data.get("type") == "message" and data.get("chatJid") and data.get("text"):
                     chat_jid = data["chatJid"]
                     source_group = data.get("groupFolder", "")
+                    source_coworker_id = data.get("coworkerId", "")
 
-                    registered_groups = deps.registered_groups()
-                    folder_is_main: dict[str, bool] = {}
-                    for group in registered_groups.values():
-                        if group.is_main:
-                            folder_is_main[group.folder] = True
-                    is_main = folder_is_main.get(source_group, False)
+                    # Find source coworker
+                    source_cw = _state.coworkers.get(source_coworker_id)
+                    is_main = source_cw.config.is_admin if source_cw else False
 
-                    target_group = registered_groups.get(chat_jid)
-                    if is_main or (target_group is not None and target_group.folder == source_group):
-                        await deps.send_message(chat_jid, data["text"])
+                    # Authorization: admin can send anywhere, others only to own conversations
+                    authorized = is_main
+                    if not authorized and source_cw:
+                        for conv in source_cw.conversations.values():
+                            if conv.conversation.channel_chat_id == chat_jid:
+                                authorized = True
+                                break
+
+                    if authorized:
+                        await deps.send_message_to_chat(chat_jid, data["text"])
                         logger.info("NATS IPC message sent", chat_jid=chat_jid, source_group=source_group)
                     else:
                         logger.warning(
@@ -216,15 +512,21 @@ async def _start_nats_ipc_subscriptions(transport: NatsTransport, deps: _IpcDeps
             try:
                 data = json.loads(msg.data)
                 source_group = data.get("groupFolder", data.get("createdBy", ""))
+                source_tenant_id = data.get("tenantId", DEFAULT_TENANT)
+                source_coworker_id = data.get("coworkerId", "")
 
-                registered_groups = deps.registered_groups()
-                folder_is_main: dict[str, bool] = {}
-                for group in registered_groups.values():
-                    if group.is_main:
-                        folder_is_main[group.folder] = True
-                is_main = folder_is_main.get(source_group, False)
+                # Determine is_main from coworker state
+                source_cw = _state.coworkers.get(source_coworker_id)
+                is_main = source_cw.config.is_admin if source_cw else False
 
-                await process_task_ipc(data, source_group, is_main, deps)
+                await process_task_ipc(
+                    data,
+                    source_group,
+                    is_main,
+                    deps,
+                    tenant_id=source_tenant_id,
+                    coworker_id=source_coworker_id,
+                )
                 await msg.ack()
             except Exception:
                 logger.exception("Error processing NATS IPC task")
@@ -237,270 +539,107 @@ async def _start_nats_ipc_subscriptions(transport: NatsTransport, deps: _IpcDeps
 
 
 # ---------------------------------------------------------------------------
-# Message processing
-# ---------------------------------------------------------------------------
-
-
-async def _process_group_messages(chat_jid: str) -> bool:
-    """Process all pending messages for a group."""
-    global _last_agent_timestamp
-
-    group = _registered_groups.get(chat_jid)
-    if group is None:
-        return True
-
-    channel = find_channel(_channels, chat_jid)
-    if channel is None:
-        logger.warning("No channel owns JID, skipping messages", chat_jid=chat_jid)
-        return True
-
-    is_main_group = group.is_main
-
-    since_timestamp = _last_agent_timestamp.get(chat_jid, "")
-    missed_messages = await get_messages_since(chat_jid, since_timestamp, ASSISTANT_NAME)
-
-    if not missed_messages:
-        return True
-
-    if not is_main_group and group.requires_trigger is not False:
-        allowlist_cfg = load_sender_allowlist()
-        has_trigger = any(
-            TRIGGER_PATTERN.search(m.content.strip())
-            and (m.is_from_me or is_trigger_allowed(chat_jid, m.sender, allowlist_cfg))
-            for m in missed_messages
-        )
-        if not has_trigger:
-            return True
-
-    prompt = format_messages(missed_messages, TIMEZONE)
-
-    previous_cursor = _last_agent_timestamp.get(chat_jid, "")
-    _last_agent_timestamp[chat_jid] = missed_messages[-1].timestamp
-    await _save_state()
-
-    logger.info("Processing messages", group=group.name, message_count=len(missed_messages))
-
-    idle_handle: asyncio.TimerHandle | None = None
-
-    def _reset_idle_timer() -> None:
-        nonlocal idle_handle
-        if idle_handle is not None:
-            idle_handle.cancel()
-        loop = asyncio.get_running_loop()
-        idle_handle = loop.call_later(
-            IDLE_TIMEOUT / 1000.0,
-            lambda: _queue.close_stdin(chat_jid),
-        )
-
-    if hasattr(channel, "set_typing"):
-        try:
-            await channel.set_typing(chat_jid, True)
-        except (OSError, RuntimeError, TypeError, ValueError):
-            logger.warning("Failed to set typing indicator", chat_jid=chat_jid)
-
-    had_error = False
-    output_sent_to_user = False
-
-    async def _on_output(result: AgentOutput) -> None:
-        nonlocal had_error, output_sent_to_user
-        if result.result:
-            raw = result.result
-            import re
-
-            text = re.sub(r"<internal>[\s\S]*?</internal>", "", raw).strip()
-            logger.info("Agent output", group=group.name, chars=len(raw))
-            if text:
-                await channel.send_message(chat_jid, text)
-                output_sent_to_user = True
-            _reset_idle_timer()
-        if result.status == "success":
-            _queue.notify_idle(chat_jid)
-        if result.status == "error":
-            had_error = True
-
-    output = await _run_agent(group, prompt, chat_jid, _on_output)
-
-    if hasattr(channel, "set_typing"):
-        with contextlib.suppress(OSError, RuntimeError, TypeError, ValueError):
-            await channel.set_typing(chat_jid, False)
-    if idle_handle is not None:
-        idle_handle.cancel()
-
-    if output == "error" or had_error:
-        if output_sent_to_user:
-            logger.warning(
-                "Agent error after output was sent, skipping cursor rollback to prevent duplicates",
-                group=group.name,
-            )
-            return True
-        _last_agent_timestamp[chat_jid] = previous_cursor
-        await _save_state()
-        logger.warning("Agent error, rolled back message cursor for retry", group=group.name)
-        return False
-
-    return True
-
-
-async def _run_agent(
-    group: RegisteredGroup,
-    prompt: str,
-    chat_jid: str,
-    on_output: Callable[[AgentOutput], Awaitable[None]] | None = None,
-) -> str:
-    """Run agent in a container. Returns 'success' or 'error'."""
-    is_main = group.is_main
-    session_id = _sessions.get(group.folder)
-
-    if _transport is not None:
-        tasks = await get_all_tasks()
-        await write_tasks_snapshot(
-            _transport,
-            group.folder,
-            is_main,
-            [
-                {
-                    "id": t.id,
-                    "groupFolder": t.group_folder,
-                    "prompt": t.prompt,
-                    "schedule_type": t.schedule_type,
-                    "schedule_value": t.schedule_value,
-                    "status": t.status,
-                    "next_run": t.next_run,
-                }
-                for t in tasks
-            ],
-        )
-
-        available_groups = await get_available_groups()
-        await write_groups_snapshot(
-            _transport,
-            group.folder,
-            is_main,
-            available_groups,
-            set(_registered_groups.keys()),
-        )
-
-    if _executor is None:
-        logger.error("Agent executor not initialized")
-        return "error"
-
-    wrapped_on_output = None
-    if on_output is not None:
-        original_on_output = on_output
-
-        async def _wrapped(output: AgentOutput) -> None:
-            if output.new_session_id:
-                _sessions[group.folder] = output.new_session_id
-                await set_session(group.folder, output.new_session_id)
-            await original_on_output(output)
-
-        wrapped_on_output = _wrapped
-
-    try:
-        output = await _executor.execute(
-            AgentInput(
-                prompt=prompt,
-                session_id=session_id,
-                group_folder=group.folder,
-                chat_jid=chat_jid,
-                is_main=is_main,
-                assistant_name=ASSISTANT_NAME,
-            ),
-            lambda handle, container_name, job_id: _queue.register_process(
-                chat_jid, handle, container_name, group.folder, job_id
-            ),
-            wrapped_on_output,
-        )
-
-        if output.new_session_id:
-            _sessions[group.folder] = output.new_session_id
-            await set_session(group.folder, output.new_session_id)
-
-        if output.status == "error":
-            logger.error("Container agent error", group=group.name, error=output.error)
-            return "error"
-
-        return "success"
-    except (OSError, RuntimeError, TypeError, ValueError):
-        logger.exception("Agent error", group=group.name)
-        return "error"
-
-
-# ---------------------------------------------------------------------------
 # Message loop
 # ---------------------------------------------------------------------------
 
 
 async def _message_loop(shutdown_event: asyncio.Event) -> None:
     """Main polling loop that detects new messages and dispatches them."""
-    global _last_timestamp, _message_loop_running
+    global _message_loop_running
 
     if _message_loop_running:
-        logger.debug("Message loop already running, skipping duplicate start")
         return
     _message_loop_running = True
 
-    logger.info("NanoClaw running", trigger=f"@{ASSISTANT_NAME}")
+    logger.info("NanoClaw running (multi-tenant)")
+
+    # Get default tenant for message cursor
+    default_tenant = await get_tenant_by_slug("default")
+    last_timestamp = default_tenant.last_message_cursor if default_tenant and default_tenant.last_message_cursor else ""
 
     while not shutdown_event.is_set():
         try:
-            jids = list(_registered_groups.keys())
-            messages, new_timestamp = await get_new_messages(jids, _last_timestamp, ASSISTANT_NAME)
+            # Collect all conversation IDs
+            conv_ids: list[str] = []
+            conv_lookup: dict[str, tuple[CoworkerState, ConversationState]] = {}
+            for cw in _state.coworkers.values():
+                for cs in cw.conversations.values():
+                    conv_ids.append(cs.conversation.id)
+                    conv_lookup[cs.conversation.id] = (cw, cs)
 
-            if messages:
-                logger.info("New messages", count=len(messages))
+            if conv_ids and default_tenant:
+                results = await get_new_messages_for_conversations(
+                    default_tenant.id, conv_ids, last_timestamp, ASSISTANT_NAME
+                )
 
-                _last_timestamp = new_timestamp
-                await _save_state()
+                if results:
+                    logger.info("New messages", count=len(results))
 
-                messages_by_group: dict[str, list[NewMessage]] = {}
-                for msg in messages:
-                    messages_by_group.setdefault(msg.chat_jid, []).append(msg)
+                    # Update cursor
+                    new_ts = max(msg.timestamp for _, msg in results)
+                    if new_ts > last_timestamp:
+                        last_timestamp = new_ts
+                        await update_tenant_message_cursor(default_tenant.id, last_timestamp)
 
-                for chat_jid, group_messages in messages_by_group.items():
-                    group = _registered_groups.get(chat_jid)
-                    if group is None:
-                        continue
+                    # Group by conversation
+                    by_conv: dict[str, list[tuple[CoworkerState, ConversationState]]] = {}
+                    for conv_id, _msg in results:
+                        if conv_id not in by_conv:
+                            by_conv[conv_id] = []
+                        if conv_id in conv_lookup:
+                            by_conv[conv_id] = [conv_lookup[conv_id]]
 
-                    channel = find_channel(_channels, chat_jid)
-                    if channel is None:
-                        logger.warning("No channel owns JID, skipping messages", chat_jid=chat_jid)
-                        continue
-
-                    is_main_group = group.is_main
-                    needs_trigger = not is_main_group and group.requires_trigger is not False
-
-                    if needs_trigger:
-                        allowlist_cfg = load_sender_allowlist()
-                        has_trigger = any(
-                            TRIGGER_PATTERN.search(m.content.strip())
-                            and (m.is_from_me or is_trigger_allowed(chat_jid, m.sender, allowlist_cfg))
-                            for m in group_messages
-                        )
-                        if not has_trigger:
+                    for conv_id, entries in by_conv.items():
+                        if not entries:
                             continue
+                        cw_state, conv_state = entries[0]
+                        config = cw_state.config
+                        conv = conv_state.conversation
+                        chat_id = conv.channel_chat_id
 
-                    all_pending = await get_messages_since(
-                        chat_jid,
-                        _last_agent_timestamp.get(chat_jid, ""),
-                        ASSISTANT_NAME,
-                    )
-                    messages_to_send = all_pending if all_pending else group_messages
-                    formatted = format_messages(messages_to_send, TIMEZONE)
+                        is_admin = config.is_admin
+                        needs_trigger = not is_admin and conv.requires_trigger
 
-                    if _queue.send_message(chat_jid, formatted):
-                        logger.debug(
-                            "Piped messages to active container", chat_jid=chat_jid, count=len(messages_to_send)
+                        if needs_trigger:
+                            # Check if any message triggers the agent
+                            conv_messages = [msg for cid, msg in results if cid == conv_id]
+                            allowlist_cfg = load_sender_allowlist()
+                            has_trigger = any(
+                                config.trigger_pattern.search(m.content.strip())
+                                and (m.is_from_me or is_trigger_allowed(chat_id, m.sender, allowlist_cfg))
+                                for m in conv_messages
+                            )
+                            if not has_trigger:
+                                continue
+
+                        # Try piping to active container first
+                        all_pending = await get_messages_since(
+                            conv.tenant_id,
+                            conv.id,
+                            conv_state.last_agent_timestamp,
+                            config.name,
+                            chat_jid=chat_id,
                         )
-                        _last_agent_timestamp[chat_jid] = messages_to_send[-1].timestamp
-                        await _save_state()
-                        if hasattr(channel, "set_typing"):
-                            try:
-                                await channel.set_typing(chat_jid, True)
-                            except (OSError, RuntimeError, TypeError, ValueError):
-                                logger.warning("Failed to set typing indicator", chat_jid=chat_jid)
-                    else:
-                        _queue.enqueue_message_check(chat_jid)
+                        if all_pending:
+                            formatted = format_messages(all_pending, TIMEZONE)
+                            if _queue.send_message(chat_id, formatted):
+                                logger.debug("Piped messages to active container", chat_id=chat_id)
+                                conv_state.last_agent_timestamp = all_pending[-1].timestamp
+                                await update_conversation_last_invocation(conv.id, all_pending[-1].timestamp)
+
+                                # Set typing
+                                binding = cw_state.channel_bindings.get(_get_channel_type_for_chat(chat_id))
+                                if binding:
+                                    gw = _gateways.get(_get_channel_type_for_chat(chat_id))
+                                    if gw:
+                                        with contextlib.suppress(OSError, RuntimeError, TypeError, ValueError):
+                                            await gw.set_typing(binding.id, chat_id, True)
+                            else:
+                                _queue.enqueue_message_check(
+                                    chat_id,
+                                    tenant_id=config.tenant_id,
+                                    coworker_id=config.id,
+                                )
         except (OSError, RuntimeError, TypeError, ValueError):
             logger.exception("Error in message loop")
 
@@ -512,13 +651,26 @@ async def _message_loop(shutdown_event: asyncio.Event) -> None:
 
 
 async def _recover_pending_messages() -> None:
-    """Startup recovery: check for unprocessed messages in registered groups."""
-    for chat_jid, group in _registered_groups.items():
-        since_timestamp = _last_agent_timestamp.get(chat_jid, "")
-        pending = await get_messages_since(chat_jid, since_timestamp, ASSISTANT_NAME)
-        if pending:
-            logger.info("Recovery: found unprocessed messages", group=group.name, pending_count=len(pending))
-            _queue.enqueue_message_check(chat_jid)
+    """Startup recovery: check for unprocessed messages."""
+    for cw in _state.coworkers.values():
+        for conv_state in cw.conversations.values():
+            conv = conv_state.conversation
+            since = conv_state.last_agent_timestamp
+            pending = await get_messages_since(
+                conv.tenant_id, conv.id, since, cw.config.name, chat_jid=conv.channel_chat_id
+            )
+            if pending:
+                logger.info(
+                    "Recovery: found unprocessed messages",
+                    coworker=cw.config.name,
+                    chat_id=conv.channel_chat_id,
+                    pending_count=len(pending),
+                )
+                _queue.enqueue_message_check(
+                    conv.channel_chat_id,
+                    tenant_id=cw.config.tenant_id,
+                    coworker_id=cw.config.id,
+                )
 
 
 async def _ensure_container_system_running() -> None:
@@ -534,31 +686,39 @@ async def _ensure_container_system_running() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _handle_remote_control(command: str, chat_jid: str, msg: NewMessage) -> None:
-    """Handle /remote-control and /remote-control-end commands."""
-    group = _registered_groups.get(chat_jid)
-    if not group or not group.is_main:
-        logger.warning("Remote control rejected: not main group", chat_jid=chat_jid, sender=msg.sender)
-        return
+async def _handle_remote_control(command: str, chat_id: str, sender: str) -> None:
+    """Handle /remote-control commands."""
+    # Find coworker with admin access
+    for cw in _state.coworkers.values():
+        if not cw.config.is_admin:
+            continue
+        conv = cw.conversations.get(chat_id)
+        if not conv:
+            continue
 
-    channel = find_channel(_channels, chat_jid)
-    if channel is None:
-        return
+        binding = cw.channel_bindings.get(_get_channel_type_for_chat(chat_id))
+        if not binding:
+            continue
 
-    if command == "/remote-control":
-        import os
+        gw = _gateways.get(_get_channel_type_for_chat(chat_id))
+        if not gw:
+            continue
 
-        result = await start_remote_control(msg.sender, chat_jid, os.getcwd())
-        if result.get("ok"):
-            await channel.send_message(chat_jid, str(result["url"]))
+        if command == "/remote-control":
+            import os
+
+            result = await start_remote_control(sender, chat_id, os.getcwd())
+            if result.get("ok"):
+                await gw.send_message(binding.id, chat_id, str(result["url"]))
+            else:
+                await gw.send_message(binding.id, chat_id, f"Remote Control failed: {result.get('error', 'unknown')}")
         else:
-            await channel.send_message(chat_jid, f"Remote Control failed: {result.get('error', 'unknown')}")
-    else:
-        result = stop_remote_control()
-        if result.get("ok"):
-            await channel.send_message(chat_jid, "Remote Control session ended.")
-        else:
-            await channel.send_message(chat_jid, str(result.get("error", "Unknown error")))
+            result = stop_remote_control()
+            if result.get("ok"):
+                await gw.send_message(binding.id, chat_id, "Remote Control session ended.")
+            else:
+                await gw.send_message(binding.id, chat_id, str(result.get("error", "Unknown error")))
+        return
 
 
 # ---------------------------------------------------------------------------
@@ -568,7 +728,7 @@ async def _handle_remote_control(command: str, chat_jid: str, msg: NewMessage) -
 
 async def main() -> None:
     """Entry point for the NanoClaw orchestrator."""
-    global _transport, _queue, _runtime, _executor
+    global _transport, _queue, _runtime, _executor, _gateways
 
     await _ensure_container_system_running()
     await init_database()
@@ -588,14 +748,29 @@ async def main() -> None:
         sys.exit(1)
 
     assert _runtime is not None
+
+    def _get_coworker(coworker_id: str) -> Coworker | None:
+        cw = _state.coworkers.get(coworker_id)
+        if cw is None:
+            return None
+        return Coworker(
+            id=cw.config.id,
+            tenant_id=cw.config.tenant_id,
+            role_id="",
+            name=cw.config.name,
+            folder=cw.config.folder,
+            is_admin=cw.config.is_admin,
+            max_concurrent=cw.config.max_concurrent,
+        )
+
     _executor = ContainerAgentExecutor(
         CLAUDE_CODE_BACKEND,
         _runtime,
         _transport,
-        lambda: _registered_groups,
+        _get_coworker,
     )
 
-    _queue = GroupQueue(transport=_transport, runtime=_runtime)
+    _queue = GroupQueue(transport=_transport, runtime=_runtime, orchestrator_state=_state)
 
     proxy_runner = await start_credential_proxy(CREDENTIAL_PROXY_PORT, PROXY_BIND_HOST)
 
@@ -609,66 +784,28 @@ async def main() -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, _signal_handler, sig.name)
 
-    import nanoclaw.channels  # noqa: F401
-    from nanoclaw.channels.registry import (
-        ChannelOpts,
-        get_channel_factory,
-        get_registered_channel_names,
-    )
+    # Initialize gateways and add bindings
+    _gateways = {
+        "telegram": TelegramGateway(on_message=_handle_incoming),
+        "slack": SlackGateway(on_message=_handle_incoming),
+    }
 
-    def _on_message(chat_jid: str, msg: NewMessage) -> None:
-        trimmed = msg.content.strip()
-        if trimmed in ("/remote-control", "/remote-control-end"):
-            asyncio.ensure_future(_handle_remote_control(trimmed, chat_jid, msg)).add_done_callback(
-                lambda fut: (
-                    logger.error("Remote control command error", chat_jid=chat_jid, error=str(fut.exception()))
-                    if fut.exception()
-                    else None
-                )
-            )
-            return
-
-        if not msg.is_from_me and not msg.is_bot_message and chat_jid in _registered_groups:
-            cfg = load_sender_allowlist()
-            if should_drop_message(chat_jid, cfg) and not is_sender_allowed(chat_jid, msg.sender, cfg):
-                if cfg.log_denied:
-                    logger.debug("sender-allowlist: dropping message (drop mode)", chat_jid=chat_jid, sender=msg.sender)
-                return
-
-        asyncio.ensure_future(store_message(msg)).add_done_callback(
-            lambda fut: logger.error("store_message error", error=str(fut.exception())) if fut.exception() else None
-        )
-
-    channel_opts = ChannelOpts(
-        on_message=_on_message,
-        on_chat_metadata=store_chat_metadata,
-        registered_groups=lambda: _registered_groups,
-    )
-
-    for channel_name in get_registered_channel_names():
-        factory = get_channel_factory(channel_name)
-        if factory is None:
-            continue
-        channel = factory(channel_opts)
-        if channel is None:
-            logger.warning(
-                "Channel installed but credentials missing -- skipping. Check .env or re-run the channel skill.",
-                channel=channel_name,
-            )
-            continue
-        _channels.append(channel)
-        await channel.connect()
-
-    if not _channels:
-        logger.critical("No channels connected")
-        sys.exit(1)
+    # Add channel bindings to gateways
+    for cw in _state.coworkers.values():
+        for channel_type, binding in cw.channel_bindings.items():
+            gw = _gateways.get(channel_type)
+            if gw:
+                try:
+                    await gw.add_binding(binding)
+                except Exception:
+                    logger.exception("Failed to add binding", binding_id=binding.id, channel_type=channel_type)
 
     start_scheduler_loop(_SchedulerDepsImpl())
 
     ipc_deps = _IpcDepsImpl()
     ipc_tasks = await _start_nats_ipc_subscriptions(_transport, ipc_deps)
 
-    _queue.set_process_messages_fn(_process_group_messages)
+    _queue.set_process_messages_fn(_process_conversation_messages)
     await _recover_pending_messages()
 
     await _message_loop(shutdown_event)
@@ -680,8 +817,8 @@ async def main() -> None:
 
     await proxy_runner.cleanup()
     await _queue.shutdown(10000)
-    for ch in _channels:
-        await ch.disconnect()
+    for gw in _gateways.values():
+        await gw.shutdown()
     await _transport.close()
     await _runtime.close()
     await close_database()
@@ -693,13 +830,32 @@ async def main() -> None:
 
 
 class _SchedulerDepsImpl:
-    """Concrete SchedulerDependencies backed by module-level state."""
+    """Concrete SchedulerDependencies backed by OrchestratorState."""
 
-    def registered_groups(self) -> dict[str, RegisteredGroup]:
-        return _registered_groups
+    @property
+    def orchestrator_state(self) -> OrchestratorState:
+        return _state
 
-    def get_sessions(self) -> dict[str, str]:
-        return _sessions
+    def get_coworker(self, coworker_id: str) -> Coworker | None:
+        cw = _state.coworkers.get(coworker_id)
+        if cw is None:
+            return None
+        return Coworker(
+            id=cw.config.id,
+            tenant_id=cw.config.tenant_id,
+            role_id="",
+            name=cw.config.name,
+            folder=cw.config.folder,
+            is_admin=cw.config.is_admin,
+            max_concurrent=cw.config.max_concurrent,
+        )
+
+    def get_session(self, conversation_id: str) -> str | None:
+        for cw in _state.coworkers.values():
+            for conv in cw.conversations.values():
+                if conv.conversation.id == conversation_id:
+                    return conv.session_id
+        return None
 
     @property
     def queue(self) -> GroupQueue:
@@ -724,51 +880,105 @@ class _SchedulerDepsImpl:
         return _executor
 
     async def send_message(self, jid: str, raw_text: str) -> None:
-        channel = find_channel(_channels, jid)
-        if channel is None:
-            logger.warning("No channel owns JID, cannot send message", jid=jid)
-            return
         text = format_outbound(raw_text)
-        if text:
-            await channel.send_message(jid, text)
+        if not text:
+            return
+        # Find the right gateway and binding for this jid
+        for cw in _state.coworkers.values():
+            for conv in cw.conversations.values():
+                if conv.conversation.channel_chat_id == jid:
+                    channel_type = _get_channel_type_for_chat(jid)
+                    binding = cw.channel_bindings.get(channel_type)
+                    if binding:
+                        gw = _gateways.get(channel_type)
+                        if gw:
+                            await gw.send_message(binding.id, jid, text)
+                    return
+        logger.warning("No channel for chat_id", chat_id=jid)
 
 
 class _IpcDepsImpl:
-    """Concrete IpcDeps backed by module-level state."""
+    """Concrete IpcDeps backed by OrchestratorState."""
 
     async def send_message(self, jid: str, text: str) -> None:
-        channel = find_channel(_channels, jid)
-        if channel is None:
-            raise RuntimeError(f"No channel for JID: {jid}")
-        await channel.send_message(jid, text)
+        await _send_to_chat(jid, text)
 
-    def registered_groups(self) -> dict[str, RegisteredGroup]:
-        return _registered_groups
+    async def send_message_to_chat(self, chat_id: str, text: str) -> None:
+        text = format_outbound(text)
+        if text:
+            await _send_to_chat(chat_id, text)
 
-    async def register_group(self, jid: str, group: RegisteredGroup) -> None:
-        await _register_group(jid, group)
+    async def get_coworker_by_folder(self, tenant_id: str, folder: str) -> Coworker | None:
+        cw = _state.get_coworker_by_folder(tenant_id, folder)
+        if cw is None:
+            return None
+        return Coworker(
+            id=cw.config.id,
+            tenant_id=cw.config.tenant_id,
+            role_id="",
+            name=cw.config.name,
+            folder=cw.config.folder,
+            is_admin=cw.config.is_admin,
+            max_concurrent=cw.config.max_concurrent,
+        )
+
+    async def get_channel_binding_for_coworker(self, coworker_id: str, channel_type: str) -> ChannelBinding | None:
+        cw = _state.coworkers.get(coworker_id)
+        if cw is None:
+            return None
+        return cw.channel_bindings.get(channel_type)
+
+    async def register_conversation(
+        self,
+        tenant_id: str,
+        coworker_id: str,
+        channel_binding_id: str,
+        channel_chat_id: str,
+        name: str | None,
+    ) -> Conversation:
+        conv = await create_conversation(
+            tenant_id=tenant_id,
+            coworker_id=coworker_id,
+            channel_binding_id=channel_binding_id,
+            channel_chat_id=channel_chat_id,
+            name=name,
+            requires_trigger=True,
+        )
+        # Add to runtime state
+        cw = _state.coworkers.get(coworker_id)
+        if cw:
+            cw.conversations[channel_chat_id] = ConversationState(conversation=conv)
+        return conv
 
     async def sync_groups(self, force: bool) -> None:
-        coros = []
-        for ch in _channels:
-            if hasattr(ch, "sync_groups"):
-                coros.append(ch.sync_groups(force))
-        if coros:
-            await asyncio.gather(*coros)
+        pass  # TODO: implement per-gateway sync
 
     async def get_available_groups(self) -> list[AvailableGroup]:
-        return await get_available_groups()
+        chats = await get_all_chats()
+        return [
+            AvailableGroup(
+                jid=c.jid,
+                name=c.name,
+                last_activity=c.last_message_time,
+                is_registered=False,
+            )
+            for c in chats
+            if c.jid != "__group_sync__" and c.is_group
+        ]
 
     def write_groups_snapshot(
         self,
-        group_folder: str,
+        tenant_id: str,
+        coworker_folder: str,
         is_main: bool,
         available_groups: list[AvailableGroup],
         registered_jids: set[str],
     ) -> None:
         if _transport is not None:
             t = asyncio.ensure_future(
-                write_groups_snapshot(_transport, group_folder, is_main, available_groups, registered_jids)
+                write_groups_snapshot(
+                    _transport, tenant_id, coworker_folder, is_main, available_groups, registered_jids
+                )
             )
             _bg_tasks.add(t)
             t.add_done_callback(_bg_tasks.discard)
@@ -776,28 +986,43 @@ class _IpcDepsImpl:
     async def on_tasks_changed(self) -> None:
         if _transport is None:
             return
-        tasks = await get_all_tasks()
-        task_rows: list[dict[str, object]] = [
-            {
-                "id": t.id,
-                "groupFolder": t.group_folder,
-                "prompt": t.prompt,
-                "schedule_type": t.schedule_type,
-                "schedule_value": t.schedule_value,
-                "status": t.status,
-                "next_run": t.next_run,
-            }
-            for t in tasks
-        ]
+        for cw in _state.coworkers.values():
+            tasks = await get_all_tasks(cw.config.tenant_id)
+            task_rows: list[dict[str, object]] = [
+                {
+                    "id": t.id,
+                    "coworkerFolder": cw.config.folder,
+                    "prompt": t.prompt,
+                    "schedule_type": t.schedule_type,
+                    "schedule_value": t.schedule_value,
+                    "status": t.status,
+                    "next_run": t.next_run,
+                }
+                for t in tasks
+            ]
 
-        async def _update_snapshots() -> None:
-            assert _transport is not None
-            for group in _registered_groups.values():
-                await write_tasks_snapshot(_transport, group.folder, group.is_main, task_rows)
+            async def _update(folder: str, is_admin: bool, tid: str, rows: list[dict[str, object]]) -> None:
+                assert _transport is not None
+                await write_tasks_snapshot(_transport, tid, folder, is_admin, rows)
 
-        t = asyncio.ensure_future(_update_snapshots())
-        _bg_tasks.add(t)
-        t.add_done_callback(_bg_tasks.discard)
+            t = asyncio.ensure_future(_update(cw.config.folder, cw.config.is_admin, cw.config.tenant_id, task_rows))
+            _bg_tasks.add(t)
+            t.add_done_callback(_bg_tasks.discard)
+
+
+async def _send_to_chat(chat_id: str, text: str) -> None:
+    """Send a message to a chat via the appropriate gateway."""
+    for cw in _state.coworkers.values():
+        for conv in cw.conversations.values():
+            if conv.conversation.channel_chat_id == chat_id:
+                channel_type = _get_channel_type_for_chat(chat_id)
+                binding = cw.channel_bindings.get(channel_type)
+                if binding:
+                    gw = _gateways.get(channel_type)
+                    if gw:
+                        await gw.send_message(binding.id, chat_id, text)
+                return
+    logger.warning("No channel for chat_id", chat_id=chat_id)
 
 
 # ---------------------------------------------------------------------------

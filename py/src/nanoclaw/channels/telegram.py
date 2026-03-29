@@ -7,13 +7,14 @@ Self-registers via registerChannel() on import.
 from __future__ import annotations
 
 import os
+import re
 from typing import TYPE_CHECKING
 
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
 from nanoclaw.channels.registry import ChannelOpts, register_channel
-from nanoclaw.core.config import ASSISTANT_NAME, TRIGGER_PATTERN
+from nanoclaw.core.config import ASSISTANT_NAME
 from nanoclaw.core.env import read_env_file
 from nanoclaw.core.logger import get_logger
 from nanoclaw.core.types import NewMessage
@@ -26,6 +27,12 @@ logger = get_logger()
 
 # Telegram message length limit
 _MAX_LENGTH = 4096
+
+# Legacy trigger pattern derived from ASSISTANT_NAME
+_TRIGGER_PATTERN: re.Pattern[str] = re.compile(
+    rf"^@{re.escape(ASSISTANT_NAME)}\b",
+    re.IGNORECASE,
+)
 
 
 async def _send_telegram_message(bot: Bot, chat_id: str | int, text: str) -> None:
@@ -93,13 +100,13 @@ class TelegramChannel:
 
             chat_name = chat.title if chat.title else sender_name
 
-            # Translate @bot_username mentions to TRIGGER_PATTERN format
+            # Translate @bot_username mentions to _TRIGGER_PATTERN format
             if self._bot_username and msg.entities:
                 for entity in msg.entities:
                     if entity.type == "mention":
                         mention_text = content[entity.offset : entity.offset + entity.length].lower()
                         if mention_text == f"@{self._bot_username.lower()}":
-                            if not TRIGGER_PATTERN.search(content):
+                            if not _TRIGGER_PATTERN.search(content):
                                 content = f"@{ASSISTANT_NAME} {content}"
                             break
 

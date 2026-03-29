@@ -606,6 +606,9 @@ async def main() -> None:
         is_main=container_input.is_main,
         js=js,
         job_id=JOB_ID,
+        tenant_id=init.tenant_id,
+        coworker_id=init.coworker_id,
+        conversation_id=init.conversation_id,
     )
 
     session_id = container_input.session_id
