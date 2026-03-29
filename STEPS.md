@@ -1,6 +1,6 @@
 # AI Coworker 平台 — 基础实施步骤
 
-将 NanoClaw Python 重写版改造为通用 AI Coworker 平台的前 4 个基础步骤。
+将 NanoClaw Python 重写版改造为通用 AI Coworker 平台的基础步骤。
 
 每个步骤包含完整的 GitHub Issue 内容和创建命令。每个 Issue 自包含，新开的 Claude Code 会话只需读取 Issue 即可独立完成工作。
 
@@ -9,12 +9,10 @@
 ## 执行顺序
 
 ```
-Step 1（文件重组）──→ Step 2（NATS IPC）
-                  ├→ Step 3（AgentExecutor）
-                  └→ Step 4（Docker API）
+Step 1（文件重组）──→ Step 2（NATS IPC）──→ Step 3（AgentExecutor + Docker API）──→ Step 4（SQLite → PostgreSQL）
 ```
 
-Step 1 必须先完成。Step 2/3/4 改动不同模块，Step 1 完成后可并行开展，按上述顺序执行可最小化合并冲突。
+严格顺序执行。Step 1、2、3 已完成。Step 4 将 SQLite 替换为 PostgreSQL，所有 db 函数改为 async，schema 预留 `tenant_id` 为多租户做准备。
 
 ---
 
@@ -941,9 +939,9 @@ $(gh issue view 2 --json title,body --jq '"# " + .title + "\n\n" + .body')
 
 ---
 
-## Step 3：AgentExecutor 抽象层
+## Step 3：AgentExecutor + ContainerRuntime 抽象层
 
-**目标**：从 `container_runner.py` 中提取 Agent 执行逻辑到 `AgentExecutor` 协议，为未来 pi-mono 替换做准备。
+**目标**：一步完成两个抽象层的提取（合并了原 Step 3 和原 Step 4）：
 
 **前置条件**：Step 1 完成。
 
@@ -1258,476 +1256,504 @@ ISSUE_EOF
 
 ### 启动 Claude Code 执行
 
-Issue 创建后，记下 Issue 编号（如 `#3`），新开 Claude Code 会话，粘贴以下内容：
+Issue 创建后，记下 Issue 编号，新开 Claude Code 会话，粘贴以下内容：
 
 ```
 请读取 GitHub Issue 并按要求完成任务：
 
-$(gh issue view 3 --json title,body --jq '"# " + .title + "\n\n" + .body')
+$(gh issue view <ISSUE_NUMBER> --json title,body --jq '"# " + .title + "\n\n" + .body')
 
 工作目录：py/
-分支：从 python-rewrite 创建新分支 step3/agent-executor
+分支：从 python-rewrite 创建新分支 step3/agent-executor-and-runtime
 完成后提交代码并创建 PR。
 ```
 
-> 将 `3` 替换为实际 Issue 编号。
+> 替换为实际 Issue 编号。
 
 ---
 
-## Step 4：Docker API + ContainerRuntime 抽象层
 
-**目标**：用 Docker Engine API（`aiodocker`）替换 `subprocess.run("docker ...")`，创建 `ContainerRuntime` 协议统一 Docker（开发）和 K8s（生产）接口。
+## Step 4：SQLite → PostgreSQL
 
-**前置条件**：Step 1 完成。Step 3（AgentExecutor）建议先完成但非必须。
+**目标**：用 PostgreSQL + `asyncpg` 替换 SQLite，所有 db 函数改为 async，schema 预留 `tenant_id` 列为将来多租户做准备。
 
-### 当前问题
+**前置条件**：Step 1、2、3 完成。
 
-- `container_runtime.py`（117 行）用 `subprocess.run` 调用 Docker CLI
-- `container_runner.py` 用 `asyncio.create_subprocess_exec("docker", "run", ...)` 启动容器
-- 基于字符串的参数构造脆弱，不支持原生 stdin/stdout 流，无法抽象到 K8s
+### 为什么现在做
 
-### 目标设计
+- 多租户需要 PG RLS（行级安全），SQLite 不支持
+- 当前 SQLite 同步调用在 asyncio 事件循环中会阻塞
+- `db/__init__.py` 已经是接口层，切换实现对调用方影响可控
 
-- `ContainerSpec`：纯数据对象，描述容器规格
-- `ContainerHandle`：运行中容器的句柄，提供 stdin/stdout 流
-- `ContainerRuntime`：容器运行时协议
-- `DockerRuntime`：基于 `aiodocker` 的实现
-- `K8sRuntime`：占位符（仅 Protocol + stub）
+### 改动范围
+
+当前 `db/sqlite.py` 有 835 行、~30 个公共函数、7 张表。全部通过 `db/__init__.py` re-export，调用方从不直接 import `sqlite`。
+
+**核心改动**：新写 `db/pg.py`，改 `__init__.py` 的 import 来源，所有调用方加 `await`。
 
 ### 创建 Issue 命令
 
 ```bash
 gh issue create \
-  --title "feat: replace Docker CLI with Docker API and add ContainerRuntime abstraction" \
+  --title "feat: replace SQLite with PostgreSQL (asyncpg)" \
   --label "enhancement,python-rewrite" \
   --body "$(cat <<'ISSUE_EOF'
 ## Context
 
-NanoClaw currently invokes Docker via \`subprocess.run("docker ...")\` and \`asyncio.create_subprocess_exec("docker", "run", ...)\`. This is fragile (string-based arg construction, output parsing), doesn't support streaming stdin/stdout natively, and cannot be abstracted to Kubernetes.
+NanoClaw currently uses SQLite (synchronous \`sqlite3\` stdlib) for persistence. This blocks the asyncio event loop and cannot support multi-tenant RLS. The database layer is already abstracted behind \`db/__init__.py\` — callers never import \`sqlite\` directly.
 
 This is **Step 4** of the AI Coworker Platform foundation. See \`STEPS.md\` for the full plan.
 
-**Prerequisite**: Step 1 (file reorg) should be completed first. Step 3 (AgentExecutor) is recommended but not strictly required.
+**Prerequisites**: Steps 1, 2, 3 completed.
 
-## Goal
+## Goals
 
-1. Replace Docker CLI subprocess calls with the Docker Engine API via \`aiodocker\`
-2. Create a \`ContainerRuntime\` protocol that can be implemented by both \`DockerRuntime\` (dev) and \`K8sRuntime\` (prod, future)
-3. Runtime selection via \`CONTAINER_RUNTIME=docker|k8s\` env var
+1. Replace \`db/sqlite.py\` with \`db/pg.py\` using \`asyncpg\`
+2. All ~30 db functions become \`async\`
+3. All callers add \`await\`
+4. Schema adds \`tenant_id\` column to every table (default \`'default'\`, for future RLS)
+5. Development environment via docker-compose (PostgreSQL + NATS)
 
-## Current Docker Usage
+## Current Architecture
 
-### \`nanoclaw/container/runtime.py\` (after Step 1, was \`container_runtime.py\`, 117 lines)
+### \`src/nanoclaw/db/sqlite.py\` (835 lines)
 
+Module-level connection:
 \`\`\`python
-CONTAINER_RUNTIME_BIN: str = "docker"
+_db: sqlite3.Connection | None = None
 
-def _detect_proxy_bind_host() -> str:
-    """Detect bind host for credential proxy (platform-specific)."""
-    # macOS/WSL: 127.0.0.1
-    # Linux: docker0 bridge IP via fcntl.ioctl
+def _get_db() -> sqlite3.Connection:
+    assert _db is not None
+    return _db
 
-def host_gateway_args() -> list[str]:
-    """Returns: ['--add-host=host.docker.internal:host-gateway'] on Linux."""
-
-def readonly_mount_args(host_path: str, container_path: str) -> list[str]:
-    """Returns: ['-v', f'{host_path}:{container_path}:ro']"""
-
-def stop_container(name: str) -> str:
-    """Returns: f'docker stop -t 1 {name}'"""
-
-def ensure_container_runtime_running() -> None:
-    """subprocess.run(['docker', 'info']) — check Docker is running."""
-
-def cleanup_orphans() -> None:
-    """subprocess: docker ps --filter name=nanoclaw- -> docker rm -f each."""
+def init_database() -> None:
+    global _db
+    _db = sqlite3.connect(str(db_path))
+    _create_schema(_db)
 \`\`\`
 
-### \`nanoclaw/container/runner.py\` (was \`container_runner.py\`, 794 lines)
-
+All functions are synchronous:
 \`\`\`python
-def build_container_args(mounts: list[VolumeMount], container_name: str) -> list[str]:
-    """Build docker run CLI args list."""
-    # Returns: ['run', '-i', '--rm', '--name', name, '-e', ..., '-v', ..., image]
-
-async def run_container_agent(...) -> ContainerOutput:
-    """asyncio.create_subprocess_exec('docker', *args, stdin=PIPE, stdout=PIPE, stderr=PIPE)"""
-    # Writes JSON to stdin
-    # Reads stdout line by line
-    # Parses output markers
+def store_message(msg: NewMessage) -> None: ...
+def get_due_tasks() -> list[ScheduledTask]: ...
+def get_all_registered_groups() -> dict[str, RegisteredGroup]: ...
+# ... ~30 functions total
 \`\`\`
 
-### \`nanoclaw/container/scheduler.py\` (was \`group_queue.py\`, 326 lines)
+### \`src/nanoclaw/db/__init__.py\` (re-exports)
 
 \`\`\`python
-async def shutdown(self, grace_period_ms: int = 0) -> None:
-    """For each active container: subprocess docker stop."""
+from nanoclaw.db.sqlite import (
+    init_database,
+    store_message,
+    get_due_tasks,
+    # ... all 30 functions
+)
 \`\`\`
 
-## Target Design
+Callers import from \`nanoclaw.db\`:
+\`\`\`python
+from nanoclaw.db import init_database, store_message, get_all_registered_groups
+\`\`\`
 
-### New Protocol & Types
+### 7 tables
 
-#### \`nanoclaw/container/runtime.py\` — Protocol + Types (rewrite)
+\`chats\`, \`messages\`, \`scheduled_tasks\`, \`task_run_logs\`, \`router_state\`, \`sessions\`, \`registered_groups\`
+
+### Callers that need \`await\` added
+
+- \`main.py\` (~30 call sites)
+- \`orchestration/task_scheduler.py\` (~15 call sites)
+- \`ipc/\` related handlers (~10 call sites)
+- Test files
+
+## Target Architecture
+
+### \`src/nanoclaw/db/pg.py\` (~700 lines)
 
 \`\`\`python
-from __future__ import annotations
-import asyncio
-from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
-from typing import Protocol
+import asyncpg
+from nanoclaw.core.config import DATABASE_URL
 
-@dataclass(frozen=True)
-class VolumeMount:
-    """Container volume mount specification."""
-    host_path: str
-    container_path: str
-    readonly: bool = False
+_pool: asyncpg.Pool | None = None
+DEFAULT_TENANT: str = "default"
 
-@dataclass(frozen=True)
-class ContainerSpec:
-    """Full specification for running a container."""
-    name: str
-    image: str
-    mounts: list[VolumeMount] = field(default_factory=list)
-    env: dict[str, str] = field(default_factory=dict)
-    stdin_data: str | None = None
-    user: str | None = None              # "uid:gid"
-    memory_limit: str | None = None      # "512m"
-    cpu_limit: float | None = None       # 1.0
-    extra_hosts: dict[str, str] = field(default_factory=dict)
-    remove_on_exit: bool = True
-    interactive: bool = True
+async def init_database(database_url: str | None = None) -> None:
+    \"\"\"Initialize PostgreSQL connection pool and create schema.\"\"\"
+    global _pool
+    url = database_url or DATABASE_URL
+    _pool = await asyncpg.create_pool(url, min_size=2, max_size=10)
+    async with _pool.acquire() as conn:
+        await _create_schema(conn)
 
-class ContainerHandle(Protocol):
-    """Handle to a running container — provides I/O streams."""
+async def close_database() -> None:
+    \"\"\"Close the connection pool. Call on shutdown.\"\"\"
+    global _pool
+    if _pool:
+        await _pool.close()
+        _pool = None
 
-    @property
-    def name(self) -> str: ...
-
-    async def read_stdout_line(self) -> str | None:
-        """Read one line from stdout. Returns None at EOF."""
-        ...
-
-    async def write_stdin(self, data: bytes) -> None:
-        """Write data to container stdin."""
-        ...
-
-    async def close_stdin(self) -> None:
-        """Close stdin (signal end of input)."""
-        ...
-
-    async def wait(self) -> int:
-        """Wait for container to exit, return exit code."""
-        ...
-
-    async def stop(self, timeout: int = 1) -> None:
-        """Stop the container."""
-        ...
-
-class ContainerRuntime(Protocol):
-    """Protocol for container execution backends."""
-
-    @property
-    def name(self) -> str: ...
-
-    async def ensure_available(self) -> None:
-        """Check runtime is available. Raises RuntimeError if not."""
-        ...
-
-    async def run(self, spec: ContainerSpec) -> ContainerHandle:
-        """Create and start a container from spec."""
-        ...
-
-    async def stop(self, name: str, timeout: int = 1) -> None:
-        """Stop a container by name."""
-        ...
-
-    async def cleanup_orphans(self, prefix: str) -> list[str]:
-        """Remove orphaned containers with given name prefix."""
-        ...
-
-    async def close(self) -> None:
-        """Close the runtime client connection."""
-        ...
-
-
-# Keep platform-specific helpers as module-level functions
-def detect_proxy_bind_host() -> str: ...
-def get_host_gateway_extra_hosts() -> dict[str, str]: ...
-
-def get_runtime(runtime_name: str | None = None) -> ContainerRuntime:
-    """Factory: create runtime from name or CONTAINER_RUNTIME env var."""
-    name = runtime_name or os.environ.get("CONTAINER_RUNTIME", "docker")
-    if name == "docker":
-        from nanoclaw.container.docker_runtime import DockerRuntime
-        return DockerRuntime()
-    elif name == "k8s":
-        raise NotImplementedError("K8sRuntime not yet implemented")
-    else:
-        raise ValueError(f"Unknown container runtime: {name}")
+def _get_pool() -> asyncpg.Pool:
+    assert _pool is not None, "Database not initialized. Call await init_database() first."
+    return _pool
 \`\`\`
 
-#### \`nanoclaw/container/docker_runtime.py\` — Docker API Implementation
+Every function becomes async:
+\`\`\`python
+# Before (sqlite):
+def store_message(msg: NewMessage) -> None:
+    db = _get_db()
+    db.execute("INSERT OR REPLACE INTO messages ...", (...))
+    db.commit()
+
+# After (pg):
+async def store_message(msg: NewMessage) -> None:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            \"\"\"INSERT INTO messages (tenant_id, id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message)
+               VALUES (\$1, \$2, \$3, \$4, \$5, \$6, \$7, \$8, \$9)
+               ON CONFLICT (tenant_id, id, chat_jid) DO UPDATE SET
+                   content = EXCLUDED.content,
+                   timestamp = EXCLUDED.timestamp\"\"\",
+            DEFAULT_TENANT, msg.id, msg.chat_jid, msg.sender, msg.sender_name,
+            msg.content, msg.timestamp, msg.is_from_me, msg.is_bot_message,
+        )
+\`\`\`
+
+### PostgreSQL Schema (with tenant_id)
+
+All tables add \`tenant_id TEXT NOT NULL DEFAULT 'default'\` as part of the primary key. This has zero cost now (single tenant), but enables RLS later without schema migration.
+
+\`\`\`sql
+CREATE TABLE IF NOT EXISTS chats (
+    tenant_id TEXT NOT NULL DEFAULT 'default',
+    jid TEXT NOT NULL,
+    name TEXT,
+    last_message_time TEXT,
+    channel TEXT,
+    is_group BOOLEAN DEFAULT FALSE,
+    PRIMARY KEY (tenant_id, jid)
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    tenant_id TEXT NOT NULL DEFAULT 'default',
+    id TEXT NOT NULL,
+    chat_jid TEXT NOT NULL,
+    sender TEXT,
+    sender_name TEXT,
+    content TEXT,
+    timestamp TEXT NOT NULL,
+    is_from_me BOOLEAN DEFAULT FALSE,
+    is_bot_message BOOLEAN DEFAULT FALSE,
+    PRIMARY KEY (tenant_id, id, chat_jid)
+);
+CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(tenant_id, timestamp);
+
+CREATE TABLE IF NOT EXISTS scheduled_tasks (
+    tenant_id TEXT NOT NULL DEFAULT 'default',
+    id TEXT PRIMARY KEY,
+    group_folder TEXT NOT NULL,
+    chat_jid TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    schedule_type TEXT NOT NULL,
+    schedule_value TEXT NOT NULL,
+    context_mode TEXT DEFAULT 'isolated',
+    next_run TEXT,
+    last_run TEXT,
+    last_result TEXT,
+    status TEXT DEFAULT 'active',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_next ON scheduled_tasks(tenant_id, next_run);
+CREATE INDEX IF NOT EXISTS idx_tasks_status ON scheduled_tasks(tenant_id, status);
+
+CREATE TABLE IF NOT EXISTS task_run_logs (
+    id SERIAL PRIMARY KEY,
+    tenant_id TEXT NOT NULL DEFAULT 'default',
+    task_id TEXT NOT NULL REFERENCES scheduled_tasks(id) ON DELETE CASCADE,
+    run_at TEXT NOT NULL,
+    duration_ms INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    result TEXT,
+    error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_task_run_logs ON task_run_logs(task_id, run_at);
+
+CREATE TABLE IF NOT EXISTS router_state (
+    tenant_id TEXT NOT NULL DEFAULT 'default',
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, key)
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    tenant_id TEXT NOT NULL DEFAULT 'default',
+    group_folder TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, group_folder)
+);
+
+CREATE TABLE IF NOT EXISTS registered_groups (
+    tenant_id TEXT NOT NULL DEFAULT 'default',
+    jid TEXT NOT NULL,
+    name TEXT NOT NULL,
+    folder TEXT NOT NULL,
+    trigger_pattern TEXT NOT NULL,
+    added_at TEXT NOT NULL,
+    container_config JSONB,
+    requires_trigger BOOLEAN DEFAULT TRUE,
+    is_main BOOLEAN DEFAULT FALSE,
+    PRIMARY KEY (tenant_id, jid),
+    UNIQUE (tenant_id, folder)
+);
+\`\`\`
+
+Key differences from SQLite schema:
+- \`tenant_id\` in every table and primary key
+- \`BOOLEAN\` instead of \`INTEGER\` for boolean fields
+- \`JSONB\` instead of \`TEXT\` for \`container_config\` (native JSON queries)
+- \`SERIAL\` instead of \`AUTOINCREMENT\` for \`task_run_logs.id\`
+- \`ON DELETE CASCADE\` for \`task_run_logs.task_id\` FK
+- Parameterized queries use \`\$1, \$2\` instead of \`?\`
+
+### SQL Syntax Differences to Handle
+
+| SQLite | PostgreSQL | Notes |
+|--------|-----------|-------|
+| \`INSERT OR REPLACE\` | \`INSERT ... ON CONFLICT DO UPDATE\` | Explicit conflict columns |
+| \`?\` placeholders | \`\$1, \$2, \$3\` | Numbered params |
+| \`INTEGER\` booleans | \`BOOLEAN\` | Native booleans |
+| \`TEXT\` for JSON | \`JSONB\` | For container_config |
+| \`AUTOINCREMENT\` | \`SERIAL\` | Auto-increment |
+| \`executescript()\` | Individual \`execute()\` calls | No batch script |
+| \`db.commit()\` | Auto-commit or \`async with conn.transaction()\` | asyncpg default |
+| \`sqlite3.Row\` dict access | \`asyncpg.Record\` dict-like access | Similar API |
+
+### \`src/nanoclaw/db/__init__.py\` — Switch Import Source
 
 \`\`\`python
-import aiodocker
+\"\"\"Data layer — PostgreSQL persistence.\"\"\"
 
-class DockerContainerHandle:
-    """Handle to a running Docker container."""
+from nanoclaw.db.pg import (
+    ChatInfo,
+    close_database,
+    create_task,
+    delete_task,
+    # ... all functions from pg.py
+    init_database,
+)
 
-    def __init__(self, container: aiodocker.containers.DockerContainer, ws: Any) -> None:
-        self._container = container
-        self._ws = ws
-
-    @property
-    def name(self) -> str:
-        return self._container._id[:12]
-
-    async def read_stdout_line(self) -> str | None: ...
-    async def write_stdin(self, data: bytes) -> None: ...
-    async def close_stdin(self) -> None: ...
-    async def wait(self) -> int: ...
-    async def stop(self, timeout: int = 1) -> None: ...
-
-
-class DockerRuntime:
-    """Docker Engine API implementation using aiodocker."""
-
-    name: str = "docker"
-
-    def __init__(self) -> None:
-        self._client: aiodocker.Docker | None = None
-
-    async def ensure_available(self) -> None:
-        self._client = aiodocker.Docker()
-        await self._client.system.info()
-
-    async def run(self, spec: ContainerSpec) -> ContainerHandle:
-        assert self._client is not None
-        config = self._spec_to_docker_config(spec)
-        container = await self._client.containers.create_or_replace(name=spec.name, config=config)
-        await container.start()
-        ws = await container.websocket(stdin=True, stdout=True, stderr=True, stream=True)
-        handle = DockerContainerHandle(container, ws)
-        if spec.stdin_data:
-            await handle.write_stdin(spec.stdin_data.encode())
-            await handle.close_stdin()
-        return handle
-
-    async def stop(self, name: str, timeout: int = 1) -> None:
-        assert self._client is not None
-        container = self._client.containers.container(name)
-        await container.stop(t=timeout)
-        await container.delete()
-
-    async def cleanup_orphans(self, prefix: str) -> list[str]:
-        assert self._client is not None
-        containers = await self._client.containers.list(filters={"name": [prefix]})
-        removed = []
-        for c in containers:
-            cname = c._container.get("Names", [""])[0].lstrip("/")
-            await c.stop(t=1)
-            await c.delete()
-            removed.append(cname)
-        return removed
-
-    async def close(self) -> None:
-        if self._client:
-            await self._client.close()
-            self._client = None
-
-    def _spec_to_docker_config(self, spec: ContainerSpec) -> dict:
-        binds = []
-        for m in spec.mounts:
-            mode = "ro" if m.readonly else "rw"
-            binds.append(f"{m.host_path}:{m.container_path}:{mode}")
-
-        config = {
-            "Image": spec.image,
-            "OpenStdin": spec.interactive,
-            "StdinOnce": True,
-            "AttachStdin": True,
-            "AttachStdout": True,
-            "AttachStderr": True,
-            "Env": [f"{k}={v}" for k, v in spec.env.items()],
-            "HostConfig": {
-                "Binds": binds,
-                "AutoRemove": spec.remove_on_exit,
-            },
-        }
-        if spec.user:
-            config["User"] = spec.user
-        if spec.memory_limit:
-            config["HostConfig"]["Memory"] = self._parse_memory(spec.memory_limit)
-        if spec.cpu_limit:
-            config["HostConfig"]["NanoCpus"] = int(spec.cpu_limit * 1e9)
-        if spec.extra_hosts:
-            config["HostConfig"]["ExtraHosts"] = [
-                f"{host}:{ip}" for host, ip in spec.extra_hosts.items()
-            ]
-        return config
+from nanoclaw.db.pg import _init_test_database as _init_test_database
 \`\`\`
 
-### Files to Modify
+Note: \`close_database()\` is new (asyncpg pool needs explicit shutdown). Add to \`__all__\` and call in \`main.py\` shutdown.
 
-#### 1. \`nanoclaw/container/runner.py\`
+### Callers: Add \`await\` to All DB Calls
 
-Refactor \`build_container_args()\` -> \`build_container_spec()\`:
+This is mechanical but touches many files:
+
+#### \`main.py\`
 
 \`\`\`python
-# Before: returns list[str] of docker CLI args
-def build_container_args(mounts: list[VolumeMount], container_name: str) -> list[str]:
+# Before:
+init_database()
+groups = get_all_registered_groups()
+store_message(msg)
+set_session(folder, session_id)
 
-# After: returns ContainerSpec
-def build_container_spec(
-    mounts: list[VolumeMount],
-    container_name: str,
-    stdin_data: str | None = None,
-) -> ContainerSpec:
+# After:
+await init_database()
+groups = await get_all_registered_groups()
+await store_message(msg)
+await set_session(folder, session_id)
+
+# Shutdown — add close_database():
+await close_database()
 \`\`\`
 
-Keep \`build_volume_mounts()\` unchanged.
-
-#### 2. \`nanoclaw/agent/claude_code.py\` (from Step 3)
-
-If Step 3 is done, update \`ClaudeCodeExecutor\` to accept \`ContainerRuntime\`:
+#### \`orchestration/task_scheduler.py\`
 
 \`\`\`python
-class ClaudeCodeExecutor:
-    def __init__(self, runtime: ContainerRuntime, ...) -> None:
-        self._runtime = runtime
+# Before:
+tasks = get_due_tasks()
+update_task_after_run(task.id, next_run, result)
+log_task_run(run_log)
 
-    async def execute(self, inp: AgentInput, ...) -> AgentOutput:
-        spec = build_container_spec(mounts, name, stdin_data=inp_json)
-        handle = await self._runtime.run(spec)
-        # Read stdout from handle instead of subprocess
+# After:
+tasks = await get_due_tasks()
+await update_task_after_run(task.id, next_run, result)
+await log_task_run(run_log)
 \`\`\`
 
-If Step 3 is NOT done yet, update \`run_container_agent()\` to accept \`ContainerRuntime\`.
+### \`core/config.py\` — Add DATABASE_URL
 
-#### 3. \`nanoclaw/container/scheduler.py\`
-
-Update container stop logic:
 \`\`\`python
-# Before: subprocess.run(stop_container(name))
-# After: await self._runtime.stop(name)
+DATABASE_URL: str = os.environ.get("DATABASE_URL", "postgresql://nanoclaw:nanoclaw@localhost:5432/nanoclaw")
 \`\`\`
 
-#### 4. \`nanoclaw/main.py\`
+### \`pyproject.toml\`
 
-Initialize runtime at startup:
-\`\`\`python
-from nanoclaw.container.runtime import get_runtime
-
-runtime = get_runtime()  # Reads CONTAINER_RUNTIME env var
-await runtime.ensure_available()
-# Pass runtime to executor, scheduler, etc.
-# On shutdown: await runtime.close()
-\`\`\`
-
-#### 5. \`nanoclaw/core/config.py\`
-
-Add config:
-\`\`\`python
-CONTAINER_RUNTIME: str = os.environ.get("CONTAINER_RUNTIME", "docker")
-\`\`\`
-
-#### 6. \`pyproject.toml\`
-
-Add dependency:
 \`\`\`toml
 dependencies = [
     ...
-    "aiodocker>=0.23",
+    "asyncpg>=0.29",
+]
+
+[project.optional-dependencies]
+dev = [
+    ...
+    "testcontainers[postgres]>=4.0",
 ]
 \`\`\`
 
-### Key Implementation Details
+### Development Setup
 
-#### stdin/stdout Streaming
+\`docker-compose.dev.yml\` (update or create):
 
-The current code uses \`asyncio.create_subprocess_exec\` with \`stdin=PIPE, stdout=PIPE\`. The Docker API equivalent uses container attach (WebSocket or raw stream).
+\`\`\`yaml
+services:
+  nats:
+    image: nats:latest
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    command: ["--jetstream"]
 
-**Important**: The output parsing logic reads stdout **line by line**, looking for \`OUTPUT_START_MARKER\` and \`OUTPUT_END_MARKER\`. The \`ContainerHandle.read_stdout_line()\` must support this pattern.
+  postgres:
+    image: postgres:16
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: nanoclaw
+      POSTGRES_USER: nanoclaw
+      POSTGRES_PASSWORD: nanoclaw
+    volumes:
+      - pgdata:/var/lib/postgresql/data
 
-\`aiodocker\` approach:
-\`\`\`python
-# Option A: Use exec + WebSocket
-ws = await container.websocket(stdin=True, stdout=True, stderr=True)
-# Read from ws.receive() — need to parse line boundaries
-
-# Option B: Use container.log(follow=True, stdout=True)
-# and attach for stdin separately
+volumes:
+  pgdata:
 \`\`\`
 
-Choose the approach that best supports line-by-line stdout reading with concurrent stdin writing.
+### Test Strategy
 
-#### Container Naming
+Use \`testcontainers\` for isolated PG per test session:
 
-Current naming: \`nanoclaw-{group_folder}-{short_uuid}\` (used for orphan cleanup with prefix filter).
+\`\`\`python
+# tests/db/conftest.py
+import pytest
+from testcontainers.postgres import PostgresContainer
 
-Keep this convention. The \`cleanup_orphans(prefix="nanoclaw-")\` method should find all matching containers.
+@pytest.fixture(scope="session")
+def pg_url():
+    with PostgresContainer("postgres:16") as pg:
+        yield pg.get_connection_url().replace("psycopg2", "postgresql")
 
-#### Platform-Specific Host Gateway
+@pytest.fixture
+async def test_db(pg_url):
+    from nanoclaw.db import init_database, close_database
+    await init_database(pg_url)
+    yield
+    # Clean tables between tests
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        for table in ["task_run_logs", "messages", "scheduled_tasks", "chats",
+                       "sessions", "registered_groups", "router_state"]:
+            await conn.execute(f"DELETE FROM {table}")
+    await close_database()
+\`\`\`
 
-Keep \`detect_proxy_bind_host()\` and \`get_host_gateway_extra_hosts()\` as module-level functions in \`runtime.py\`. These are used by \`build_container_spec()\` to configure host access.
+### What NOT to Do
 
-#### Error Handling
+- **No data migration tool** — clean start from empty PG
+- **No SQLite fallback** — clean cut, delete \`sqlite.py\`
+- **No JSON state migration code** — legacy NanoClaw migration not needed
+- **No multi-tenant RLS yet** — just \`tenant_id\` columns and default values
+- **No \`tenant_id\` parameter on public functions yet** — all functions use \`DEFAULT_TENANT\` internally. When multi-tenant is implemented, add \`tenant_id\` parameter to each function.
 
-- \`ensure_available()\` raises \`RuntimeError\` with helpful diagnostic message (same as current behavior)
-- \`run()\` raises \`RuntimeError\` if container fails to start
-- \`stop()\` is idempotent (no error if container already stopped)
-- \`cleanup_orphans()\` logs and continues if individual container removal fails
+### DEFAULT_TENANT Constant
+
+\`\`\`python
+DEFAULT_TENANT: str = "default"
+\`\`\`
+
+All queries include \`tenant_id\` with \`DEFAULT_TENANT\`. When multi-tenant is implemented later, this becomes the actual tenant ID from request context.
+
+## Files Summary
+
+### New Files
+
+| File | Content |
+|------|---------|
+| \`src/nanoclaw/db/pg.py\` | PostgreSQL implementation (~700 lines, all async) |
+| \`docker-compose.dev.yml\` | PG 16 + NATS dev services |
+| \`tests/db/conftest.py\` | PG test fixtures with testcontainers |
+
+### Modified Files
+
+| File | Changes |
+|------|---------|
+| \`db/__init__.py\` | Switch imports from \`sqlite\` to \`pg\`, add \`close_database\` |
+| \`core/config.py\` | Add \`DATABASE_URL\` |
+| \`pyproject.toml\` | Add \`asyncpg\`, add \`testcontainers\` to dev deps |
+| \`main.py\` | ~30 call sites: add \`await\`, add \`await close_database()\` on shutdown |
+| \`orchestration/task_scheduler.py\` | ~15 call sites: add \`await\` |
+| \`tests/db/test_sqlite.py\` | Rename to \`tests/db/test_pg.py\`, rewrite for async |
+| \`tests/conftest.py\` | Update db fixture for async PG |
+| \`tests/test_e2e.py\` | Update db calls to async |
+| \`tests/test_user_flow.py\` | Update db calls to async |
+
+### Deleted Files
+
+| File | Reason |
+|------|--------|
+| \`src/nanoclaw/db/sqlite.py\` | Replaced by \`pg.py\` |
 
 ## Acceptance Criteria
 
-- [ ] \`aiodocker\` added to \`pyproject.toml\`
-- [ ] \`nanoclaw/container/runtime.py\` defines \`ContainerSpec\`, \`ContainerHandle\`, \`ContainerRuntime\` protocols
-- [ ] \`nanoclaw/container/docker_runtime.py\` implements \`DockerRuntime\` using \`aiodocker\`
-- [ ] \`DockerRuntime.ensure_available()\` verifies Docker daemon connectivity
-- [ ] \`DockerRuntime.run()\` creates and starts containers with proper stdin/stdout streaming
-- [ ] \`DockerRuntime.stop()\` stops containers via Docker API
-- [ ] \`DockerRuntime.cleanup_orphans()\` finds and removes containers by name prefix
-- [ ] \`ContainerHandle.read_stdout_line()\` supports line-by-line reading (for output marker parsing)
-- [ ] \`ContainerHandle.write_stdin()\` supports writing input data
-- [ ] \`build_container_args()\` replaced with \`build_container_spec()\` returning \`ContainerSpec\`
-- [ ] \`get_runtime()\` factory reads \`CONTAINER_RUNTIME\` env var, returns \`DockerRuntime\` (or raises for \`k8s\`)
-- [ ] Platform-specific helpers (\`detect_proxy_bind_host\`, \`get_host_gateway_extra_hosts\`) preserved
-- [ ] All callers updated to use \`ContainerRuntime\` protocol
-- [ ] K8sRuntime stub exists (raises \`NotImplementedError\`)
-- [ ] All existing tests pass
-- [ ] New unit tests for \`DockerRuntime\` (mock \`aiodocker\`)
-- [ ] New unit tests for \`ContainerSpec\` construction
-- [ ] Integration test: \`DockerRuntime.run()\` -> container starts -> read stdout -> stop
-- [ ] \`ruff check . && mypy --strict nanoclaw && pytest\` all pass
-- [ ] No \`subprocess.run("docker ...")\` calls remain in the codebase
+- [ ] \`asyncpg\` added to \`pyproject.toml\`
+- [ ] \`src/nanoclaw/db/pg.py\` implements all ~30 functions as \`async\`
+- [ ] Every table has \`tenant_id TEXT NOT NULL DEFAULT 'default'\` column
+- [ ] \`tenant_id\` is part of every primary key and index
+- [ ] \`container_config\` uses \`JSONB\` type
+- [ ] \`db/__init__.py\` imports from \`pg\` (not \`sqlite\`)
+- [ ] \`close_database()\` exported and called in \`main.py\` shutdown
+- [ ] All callers use \`await\` for db calls
+- [ ] \`DATABASE_URL\` config in \`core/config.py\`
+- [ ] \`docker-compose.dev.yml\` has PG 16 + NATS services
+- [ ] \`db/sqlite.py\` deleted
+- [ ] No \`import sqlite3\` remains in production code
+- [ ] All tests pass against real PostgreSQL
+- [ ] \`ruff check . && mypy --strict src/nanoclaw && pytest\` all pass
+- [ ] \`DEFAULT_TENANT\` used consistently across all queries
+- [ ] No JSON state migration code
 
 ## Important Notes
 
 - **Working directory**: Project root (\`py/\` directory)
-- **\`aiodocker\`** is the recommended async Docker client for Python — fits the asyncio architecture
-- **stdin/stdout streaming** is the trickiest part — test thoroughly with actual containers
-- **Docker socket**: \`aiodocker\` connects to \`/var/run/docker.sock\` by default (Linux) or Docker Desktop socket (macOS)
-- **AutoRemove**: Docker API's \`AutoRemove\` + attach can have race conditions — consider managing removal manually
-- **Branch**: Create from \`python-rewrite\` branch (after Step 1 merge)
-- **K8s implementation is NOT in scope** — only the protocol and a stub class
+- **asyncpg uses \`\$1, \$2\` params** — not \`?\`. Every query needs rewriting.
+- **asyncpg returns \`asyncpg.Record\`** — dict-like access (\`row["col"]\`).
+- **No \`executescript()\`** — each CREATE TABLE as separate \`execute()\`.
+- **Transactions**: asyncpg auto-commits. Use \`async with conn.transaction():\` for atomicity.
+- **Boolean**: PostgreSQL native \`BOOLEAN\`. No more \`1/0\` integers.
+- **tenant_id now, RLS later** — just columns and defaults. Policies in future step.
+- **Branch**: Create from \`python-rewrite\` branch (after Step 3 merged)
 ISSUE_EOF
 )"
 ```
 
 ### 启动 Claude Code 执行
 
-Issue 创建后，记下 Issue 编号（如 `#4`），新开 Claude Code 会话，粘贴以下内容：
+Issue 创建后，记下 Issue 编号，新开 Claude Code 会话，粘贴以下内容：
 
 ```
 请读取 GitHub Issue 并按要求完成任务：
 
-$(gh issue view 4 --json title,body --jq '"# " + .title + "\n\n" + .body')
+$(gh issue view 8 --json title,body --jq '"# " + .title + "\n\n" + .body')
 
 工作目录：py/
-分支：从 python-rewrite 创建新分支 step4/docker-api
+分支：从 python-rewrite 创建新分支 step4/sqlite-to-pg
 完成后提交代码并创建 PR。
 ```
 
-> 将 `4` 替换为实际 Issue 编号。
+> 替换为实际 Issue 编号。
