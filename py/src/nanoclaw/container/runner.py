@@ -38,17 +38,11 @@ if TYPE_CHECKING:
     from nanoclaw.core.types import Coworker, RegisteredGroup
     from nanoclaw.ipc.nats_transport import NatsTransport
 
-# Backward-compat aliases
-from nanoclaw.agent.executor import AgentInput as ContainerInput
-from nanoclaw.agent.executor import AgentOutput as ContainerOutput
-
 logger = get_logger()
 
 # Re-export VolumeMount from runtime (it used to live here)
 __all__ = [
     "AvailableGroup",
-    "ContainerInput",
-    "ContainerOutput",
     "ContainerSpec",
     "VolumeMount",
     "build_container_spec",
@@ -57,6 +51,19 @@ __all__ = [
     "write_groups_snapshot",
     "write_tasks_snapshot",
 ]
+
+
+def __getattr__(name: str) -> object:
+    """Lazy backward-compat aliases (avoids circular import)."""
+    if name == "ContainerInput":
+        from nanoclaw.agent.executor import AgentInput
+
+        return AgentInput
+    if name == "ContainerOutput":
+        from nanoclaw.agent.executor import AgentOutput
+
+        return AgentOutput
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 @dataclass(frozen=True)

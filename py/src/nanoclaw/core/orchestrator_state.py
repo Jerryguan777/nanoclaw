@@ -38,9 +38,11 @@ class CoworkerConfig:
     def from_role_and_coworker(role: Role, coworker: Coworker) -> CoworkerConfig:
         """Merge Role template + Coworker instance into runtime config."""
         trigger: re.Pattern[str] | None = None
-        # Build trigger pattern from coworker name
+        # Build trigger pattern from coworker name.
+        # Use (?=\s|$) instead of \b because \b fails when the name
+        # ends with a non-word character like ')'.
         if coworker.name:
-            trigger = re.compile(rf"^@{re.escape(coworker.name)}\b", re.IGNORECASE)
+            trigger = re.compile(rf"^@{re.escape(coworker.name)}(?=\s|$)", re.IGNORECASE)
 
         return CoworkerConfig(
             id=coworker.id,
