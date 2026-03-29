@@ -466,6 +466,11 @@ async def _start_nats_ipc_subscriptions(transport: NatsTransport, deps: _IpcDeps
     """Subscribe to NATS subjects for agent IPC messages and tasks."""
     tasks: list[asyncio.Task[None]] = []
 
+    # Clean up stale durable consumers from previous runs that didn't shut down cleanly
+    for consumer_name in ("orch-messages", "orch-tasks"):
+        with contextlib.suppress(Exception):
+            await transport.js.delete_consumer("agent-ipc", consumer_name)
+
     messages_sub = await transport.js.subscribe("agent.*.messages", durable="orch-messages")
 
     async def _handle_messages() -> None:
