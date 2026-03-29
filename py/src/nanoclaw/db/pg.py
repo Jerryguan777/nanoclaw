@@ -63,7 +63,13 @@ def _get_pool() -> asyncpg.Pool[asyncpg.Record]:
 
 
 async def _create_schema(conn: asyncpg.pool.PoolConnectionProxy[asyncpg.Record]) -> None:
-    """Create tables and indexes."""
+    """Create tables and indexes.
+
+    Handles upgrade from Step 4 (legacy tables) to Step 5 (multi-tenant).
+    Legacy tables (messages, sessions, scheduled_tasks, task_run_logs) may exist
+    with a different schema. We detect this and skip new-format table creation
+    until the migration script has run.
+    """
     # --- New multi-tenant tables ---
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS tenants (
@@ -143,62 +149,72 @@ async def _create_schema(conn: asyncpg.pool.PoolConnectionProxy[asyncpg.Record])
         )
     """)
 
-    # --- Rewritten tables with UUID types ---
-    await conn.execute("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            conversation_id UUID PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
-            tenant_id UUID NOT NULL REFERENCES tenants(id),
-            coworker_id UUID NOT NULL REFERENCES coworkers(id),
-            session_id TEXT NOT NULL
+    # --- Tables that exist in both legacy (Step 4) and new (Step 5) formats ---
+    # Detect if legacy messages table exists (has chat_jid column).
+    # If so, skip creating new-format tables — migration script will handle it.
+    legacy_exists = await conn.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='messages' AND column_name='chat_jid')"
+    )
+
+    if not legacy_exists:
+        # Fresh install or post-migration: create new-format tables
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                conversation_id UUID PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+                tenant_id UUID NOT NULL REFERENCES tenants(id),
+                coworker_id UUID NOT NULL REFERENCES coworkers(id),
+                session_id TEXT NOT NULL
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id TEXT NOT NULL,
+                tenant_id UUID NOT NULL REFERENCES tenants(id),
+                conversation_id UUID NOT NULL REFERENCES conversations(id),
+                sender TEXT,
+                sender_name TEXT,
+                content TEXT,
+                timestamp TIMESTAMPTZ NOT NULL,
+                is_from_me BOOLEAN DEFAULT FALSE,
+                is_bot_message BOOLEAN DEFAULT FALSE,
+                PRIMARY KEY (tenant_id, id, conversation_id)
+            )
+        """)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(tenant_id, conversation_id, timestamp)"
         )
-    """)
-    await conn.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            id TEXT NOT NULL,
-            tenant_id UUID NOT NULL REFERENCES tenants(id),
-            conversation_id UUID NOT NULL REFERENCES conversations(id),
-            sender TEXT,
-            sender_name TEXT,
-            content TEXT,
-            timestamp TIMESTAMPTZ NOT NULL,
-            is_from_me BOOLEAN DEFAULT FALSE,
-            is_bot_message BOOLEAN DEFAULT FALSE,
-            PRIMARY KEY (tenant_id, id, conversation_id)
-        )
-    """)
-    await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(tenant_id, conversation_id, timestamp)")
-    await conn.execute("""
-        CREATE TABLE IF NOT EXISTS scheduled_tasks (
-            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            tenant_id UUID NOT NULL REFERENCES tenants(id),
-            coworker_id UUID NOT NULL REFERENCES coworkers(id),
-            conversation_id UUID REFERENCES conversations(id),
-            prompt TEXT NOT NULL,
-            schedule_type TEXT NOT NULL,
-            schedule_value TEXT NOT NULL,
-            context_mode TEXT DEFAULT 'isolated',
-            next_run TIMESTAMPTZ,
-            last_run TIMESTAMPTZ,
-            last_result TEXT,
-            status TEXT DEFAULT 'active',
-            created_at TIMESTAMPTZ DEFAULT now()
-        )
-    """)
-    await conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_next ON scheduled_tasks(tenant_id, next_run)")
-    await conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_status ON scheduled_tasks(tenant_id, status)")
-    await conn.execute("""
-        CREATE TABLE IF NOT EXISTS task_run_logs (
-            id SERIAL PRIMARY KEY,
-            tenant_id UUID NOT NULL REFERENCES tenants(id),
-            task_id UUID NOT NULL REFERENCES scheduled_tasks(id) ON DELETE CASCADE,
-            run_at TIMESTAMPTZ NOT NULL,
-            duration_ms INT NOT NULL,
-            status TEXT NOT NULL,
-            result TEXT,
-            error TEXT
-        )
-    """)
-    await conn.execute("CREATE INDEX IF NOT EXISTS idx_task_run_logs ON task_run_logs(task_id, run_at)")
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS scheduled_tasks (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                tenant_id UUID NOT NULL REFERENCES tenants(id),
+                coworker_id UUID NOT NULL REFERENCES coworkers(id),
+                conversation_id UUID REFERENCES conversations(id),
+                prompt TEXT NOT NULL,
+                schedule_type TEXT NOT NULL,
+                schedule_value TEXT NOT NULL,
+                context_mode TEXT DEFAULT 'isolated',
+                next_run TIMESTAMPTZ,
+                last_run TIMESTAMPTZ,
+                last_result TEXT,
+                status TEXT DEFAULT 'active',
+                created_at TIMESTAMPTZ DEFAULT now()
+            )
+        """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_next ON scheduled_tasks(tenant_id, next_run)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_status ON scheduled_tasks(tenant_id, status)")
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS task_run_logs (
+                id SERIAL PRIMARY KEY,
+                tenant_id UUID NOT NULL REFERENCES tenants(id),
+                task_id UUID NOT NULL REFERENCES scheduled_tasks(id) ON DELETE CASCADE,
+                run_at TIMESTAMPTZ NOT NULL,
+                duration_ms INT NOT NULL,
+                status TEXT NOT NULL,
+                result TEXT,
+                error TEXT
+            )
+        """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_task_run_logs ON task_run_logs(task_id, run_at)")
 
     # --- Legacy tables (kept for migration, dropped after) ---
     await conn.execute("""
@@ -1474,11 +1490,17 @@ async def get_all_registered_groups() -> dict[str, RegisteredGroup]:
 
 
 async def get_session_legacy(group_folder: str) -> str | None:
-    """Get session from legacy sessions table."""
+    """Get session from legacy sessions table (old 'sessions' or 'sessions_legacy')."""
     pool = _get_pool()
     async with pool.acquire() as conn:
+        # Try the old sessions table first (pre-migration)
+        has_old = await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM information_schema.columns "
+            "WHERE table_name='sessions' AND column_name='group_folder')"
+        )
+        table = "sessions" if has_old else "sessions_legacy"
         row = await conn.fetchrow(
-            "SELECT session_id FROM sessions_legacy WHERE tenant_id = $1 AND group_folder = $2",
+            f"SELECT session_id FROM {table} WHERE tenant_id = $1 AND group_folder = $2",
             DEFAULT_TENANT,
             group_folder,
         )
@@ -1491,9 +1513,14 @@ async def set_session_legacy(group_folder: str, session_id: str) -> None:
     """Set session in legacy sessions table."""
     pool = _get_pool()
     async with pool.acquire() as conn:
+        has_old = await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM information_schema.columns "
+            "WHERE table_name='sessions' AND column_name='group_folder')"
+        )
+        table = "sessions" if has_old else "sessions_legacy"
         await conn.execute(
-            """
-            INSERT INTO sessions_legacy (tenant_id, group_folder, session_id) VALUES ($1, $2, $3)
+            f"""
+            INSERT INTO {table} (tenant_id, group_folder, session_id) VALUES ($1, $2, $3)
             ON CONFLICT (tenant_id, group_folder) DO UPDATE SET session_id = EXCLUDED.session_id
             """,
             DEFAULT_TENANT,
@@ -1506,8 +1533,13 @@ async def get_all_sessions_legacy() -> dict[str, str]:
     """Get all legacy session mappings (group_folder -> session_id)."""
     pool = _get_pool()
     async with pool.acquire() as conn:
+        has_old = await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM information_schema.columns "
+            "WHERE table_name='sessions' AND column_name='group_folder')"
+        )
+        table = "sessions" if has_old else "sessions_legacy"
         rows = await conn.fetch(
-            "SELECT group_folder, session_id FROM sessions_legacy WHERE tenant_id = $1",
+            f"SELECT group_folder, session_id FROM {table} WHERE tenant_id = $1",
             DEFAULT_TENANT,
         )
     return {row["group_folder"]: row["session_id"] for row in rows}
@@ -1519,11 +1551,19 @@ async def get_all_sessions_legacy() -> dict[str, str]:
 
 
 async def drop_legacy_tables() -> None:
-    """Drop legacy tables after migration."""
+    """Drop legacy tables and recreate shared tables in new format."""
     pool = _get_pool()
     async with pool.acquire() as conn:
+        # Drop legacy-only tables
         await conn.execute("DROP TABLE IF EXISTS router_state CASCADE")
         await conn.execute("DROP TABLE IF EXISTS registered_groups CASCADE")
         await conn.execute("DROP TABLE IF EXISTS chats CASCADE")
         await conn.execute("DROP TABLE IF EXISTS sessions_legacy CASCADE")
-    logger.info("Legacy tables dropped")
+        # Drop old-format shared tables (messages, sessions, scheduled_tasks, task_run_logs)
+        await conn.execute("DROP TABLE IF EXISTS task_run_logs CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS messages CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS scheduled_tasks CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS sessions CASCADE")
+        # Recreate in new format (now legacy_exists check will be False)
+        await _create_schema(conn)
+    logger.info("Legacy tables dropped and new-format tables created")
