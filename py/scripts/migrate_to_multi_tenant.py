@@ -15,7 +15,7 @@ import asyncio
 import shutil
 from dataclasses import dataclass
 
-from nanoclaw.core.config import DATA_DIR, GROUPS_DIR
+from nanoclaw.core.config import ASSISTANT_NAME, DATA_DIR, GROUPS_DIR
 from nanoclaw.core.env import read_env_file
 from nanoclaw.core.logger import get_logger
 from nanoclaw.db.pg import (
@@ -155,10 +155,12 @@ async def migrate_to_multi_tenant() -> None:
     for p in pending:
         logger.info("Migrating group", jid=p.jid, name=p.name, folder=p.folder, channel_type=p.channel_type)
 
+        # In single-tenant migration, all coworkers share the global ASSISTANT_NAME.
+        # The group name is used as the conversation display name instead.
         coworker = await create_coworker(
             tenant_id=tenant.id,
             role_id=role.id,
-            name=p.name,
+            name=ASSISTANT_NAME,
             folder=p.folder,
             is_admin=p.is_main,
             container_config=p.container_config,  # type: ignore[arg-type]
