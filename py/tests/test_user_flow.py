@@ -85,10 +85,6 @@ async def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_url: str) -> P
     monkeypatch.setattr("nanoclaw.core.config.IDLE_TIMEOUT", 2000)
     monkeypatch.setattr("nanoclaw.core.config.TIMEZONE", "UTC")
     monkeypatch.setattr("nanoclaw.core.config.ASSISTANT_NAME", "Andy")
-    monkeypatch.setattr(
-        "nanoclaw.core.config.TRIGGER_PATTERN",
-        re.compile(r"^@Andy\b", re.IGNORECASE),
-    )
 
     # Patch modules that captured config at import time
     monkeypatch.setattr("nanoclaw.core.group_folder.DATA_DIR", data_dir)
@@ -96,7 +92,7 @@ async def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_url: str) -> P
     monkeypatch.setattr("nanoclaw.main.TIMEZONE", "UTC")
     monkeypatch.setattr("nanoclaw.main.ASSISTANT_NAME", "Andy")
     monkeypatch.setattr(
-        "nanoclaw.main.TRIGGER_PATTERN",
+        "nanoclaw.main._TRIGGER_PATTERN",
         re.compile(r"^@Andy\b", re.IGNORECASE),
     )
 

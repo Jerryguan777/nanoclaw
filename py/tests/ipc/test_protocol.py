@@ -46,6 +46,24 @@ def test_agent_init_data_optional_fields() -> None:
     assert restored.assistant_name is None
     assert restored.system_prompt is None
     assert restored.role_config is None
+    assert restored.tenant_id is None
+    assert restored.coworker_id is None
+
+
+def test_agent_init_data_tenant_coworker_roundtrip() -> None:
+    """AgentInitData serializes tenant_id and coworker_id."""
+    init = AgentInitData(
+        prompt="Test",
+        group_folder="group",
+        chat_jid="jid",
+        is_main=True,
+        tenant_id="tenant-abc",
+        coworker_id="cw-123",
+    )
+    data = init.serialize()
+    restored = AgentInitData.deserialize(data)
+    assert restored.tenant_id == "tenant-abc"
+    assert restored.coworker_id == "cw-123"
 
 
 def test_agent_init_data_frozen() -> None:

@@ -29,6 +29,8 @@ class AgentInput:
     assistant_name: str | None = None
     system_prompt: str | None = None
     role_config: dict[str, object] | None = None
+    tenant_id: str | None = None
+    coworker_id: str | None = None
 
 
 @dataclass(frozen=True)

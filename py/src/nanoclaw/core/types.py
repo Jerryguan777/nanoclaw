@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Literal, Protocol, runtime_checkable
+
+# ---------------------------------------------------------------------------
+# Mount / container config
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -46,9 +51,111 @@ class ContainerConfig:
     timeout: int = 300_000
 
 
+# ---------------------------------------------------------------------------
+# Multi-tenant entities
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Tenant:
+    """An organization / workspace."""
+
+    id: str
+    slug: str
+    name: str
+    plan: str = "starter"
+    config: dict[str, object] = field(default_factory=dict)
+    max_concurrent_containers: int = 5
+    created_at: str = ""
+
+
+@dataclass
+class User:
+    """A human user within a tenant."""
+
+    id: str
+    tenant_id: str
+    name: str
+    email: str | None = None
+    role: str = "member"  # admin / manager / member
+    channel_ids: dict[str, str] = field(default_factory=dict)
+    created_at: str = ""
+
+
+@dataclass
+class Role:
+    """An AI agent template (prompt + tools + skills + backend)."""
+
+    id: str
+    tenant_id: str
+    name: str
+    role_type: str  # "operations" / "logistics" / "cs" / "general"
+    agent_backend: str = "claude-code"
+    system_prompt: str | None = None
+    tools: list[str] = field(default_factory=list)
+    skills: list[str] = field(default_factory=list)
+    a2a_config: dict[str, object] = field(default_factory=dict)
+    authorization: dict[str, object] = field(default_factory=dict)
+    config_overrides: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass
+class Coworker:
+    """A role instance with its own workspace and identity."""
+
+    id: str
+    tenant_id: str
+    role_id: str
+    name: str
+    folder: str
+    is_admin: bool = False
+    container_config: ContainerConfig | None = None
+    max_concurrent: int = 2
+    status: str = "active"
+
+
+@dataclass
+class ChannelBinding:
+    """Bot credentials: per-coworker per-channel-type."""
+
+    id: str
+    coworker_id: str
+    tenant_id: str
+    channel_type: str  # "telegram" / "slack" / "web"
+    credentials: dict[str, str] = field(default_factory=dict)
+    bot_display_name: str | None = None
+    status: str = "active"
+
+
+@dataclass
+class Conversation:
+    """Per-coworker per-chat context."""
+
+    id: str
+    tenant_id: str
+    coworker_id: str
+    channel_binding_id: str
+    channel_chat_id: str
+    name: str | None = None
+    trigger_pattern: str | None = None
+    requires_trigger: bool = True
+    is_main: bool = False
+    created_at: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Legacy types (backward compatibility)
+# ---------------------------------------------------------------------------
+
+
 @dataclass
 class RegisteredGroup:
-    """A registered group with its configuration."""
+    """A registered group with its configuration.
+
+    .. deprecated::
+        Use Coworker + Conversation instead.  Kept for backward-compat
+        during migration.  Will be removed in a future release.
+    """
 
     name: str
     folder: str
@@ -57,6 +164,63 @@ class RegisteredGroup:
     container_config: ContainerConfig | None = None
     requires_trigger: bool = True
     is_main: bool = False
+
+
+def registered_group_to_coworker(
+    jid: str,
+    group: RegisteredGroup,
+    tenant_id: str,
+    role_id: str,
+    coworker_id: str = "",
+    binding_id: str = "",
+    conversation_id: str = "",
+) -> tuple[Coworker, ChannelBinding, Conversation]:
+    """Convert a RegisteredGroup into the new Coworker + ChannelBinding + Conversation triple.
+
+    Caller must supply IDs (typically UUIDs).  Channel type is inferred from JID prefix.
+    """
+    warnings.warn(
+        "registered_group_to_coworker is a migration helper and will be removed",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    channel_type = "telegram" if jid.startswith("tg:") else "slack" if jid.startswith("slack:") else "unknown"
+    chat_id = jid.split(":", 1)[1] if ":" in jid else jid
+
+    coworker = Coworker(
+        id=coworker_id,
+        tenant_id=tenant_id,
+        role_id=role_id,
+        name=group.name,
+        folder=group.folder,
+        is_admin=group.is_main,
+        container_config=group.container_config,
+    )
+    binding = ChannelBinding(
+        id=binding_id,
+        coworker_id=coworker_id,
+        tenant_id=tenant_id,
+        channel_type=channel_type,
+        credentials={},
+    )
+    conversation = Conversation(
+        id=conversation_id,
+        tenant_id=tenant_id,
+        coworker_id=coworker_id,
+        channel_binding_id=binding_id,
+        channel_chat_id=chat_id,
+        name=group.name,
+        trigger_pattern=group.trigger,
+        requires_trigger=group.requires_trigger,
+        is_main=group.is_main,
+        created_at=group.added_at,
+    )
+    return coworker, binding, conversation
+
+
+# ---------------------------------------------------------------------------
+# Message types
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -89,6 +253,8 @@ class ScheduledTask:
     last_result: str | None = None
     status: Literal["active", "paused", "completed"] = "active"
     created_at: str = ""
+    coworker_id: str | None = None
+    conversation_id: str | None = None
 
 
 @dataclass(frozen=True)

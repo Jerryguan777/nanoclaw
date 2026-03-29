@@ -22,6 +22,8 @@ class AgentInitData:
     assistant_name: str | None = None
     system_prompt: str | None = None
     role_config: dict[str, object] | None = None
+    tenant_id: str | None = None
+    coworker_id: str | None = None
 
     def serialize(self) -> bytes:
         return json.dumps(asdict(self)).encode()
@@ -39,4 +41,6 @@ class AgentInitData:
             assistant_name=raw.get("assistant_name"),
             system_prompt=raw.get("system_prompt"),
             role_config=raw.get("role_config"),
+            tenant_id=raw.get("tenant_id"),
+            coworker_id=raw.get("coworker_id"),
         )

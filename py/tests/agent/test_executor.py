@@ -27,6 +27,21 @@ def test_agent_input_optional_fields() -> None:
     assert inp.assistant_name is None
     assert inp.system_prompt is None
     assert inp.role_config is None
+    assert inp.tenant_id is None
+    assert inp.coworker_id is None
+
+
+def test_agent_input_tenant_coworker() -> None:
+    inp = AgentInput(
+        prompt="p",
+        group_folder="g",
+        chat_jid="j",
+        is_main=False,
+        tenant_id="t1",
+        coworker_id="cw1",
+    )
+    assert inp.tenant_id == "t1"
+    assert inp.coworker_id == "cw1"
 
 
 def test_agent_input_all_fields() -> None:

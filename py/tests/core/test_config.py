@@ -6,12 +6,12 @@ from nanoclaw.core.config import (
     CONTAINER_TIMEOUT,
     CREDENTIAL_PROXY_PORT,
     DATA_DIR,
+    GLOBAL_MAX_CONTAINERS,
     GROUPS_DIR,
     IDLE_TIMEOUT,
     MAX_CONCURRENT_CONTAINERS,
     NATS_URL,
     POLL_INTERVAL,
-    TRIGGER_PATTERN,
 )
 
 
@@ -22,19 +22,12 @@ def test_default_values() -> None:
     assert CREDENTIAL_PROXY_PORT == 3001
     assert IDLE_TIMEOUT == 1800000
     assert MAX_CONCURRENT_CONTAINERS >= 1
+    assert GLOBAL_MAX_CONTAINERS >= 1
 
 
 def test_paths_exist_as_path_objects() -> None:
     assert hasattr(GROUPS_DIR, "exists")
     assert hasattr(DATA_DIR, "exists")
-
-
-def test_trigger_pattern() -> None:
-    name = ASSISTANT_NAME
-    assert TRIGGER_PATTERN.match(f"@{name} hello")
-    assert TRIGGER_PATTERN.match(f"@{name.upper()} hello")
-    assert not TRIGGER_PATTERN.match("hello")
-    assert not TRIGGER_PATTERN.match(f"not @{name}")
 
 
 def test_container_image() -> None:

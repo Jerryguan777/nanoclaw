@@ -22,6 +22,7 @@ from nanoclaw.container.runtime import (
 from nanoclaw.core.config import (
     CONTAINER_IMAGE,
     CREDENTIAL_PROXY_PORT,
+    DATA_DIR,
     GROUPS_DIR,
     NATS_URL,
     PROJECT_ROOT,
@@ -34,7 +35,7 @@ from nanoclaw.security.mount_security import validate_additional_mounts
 
 if TYPE_CHECKING:
     from nanoclaw.agent.executor import AgentBackendConfig
-    from nanoclaw.core.types import RegisteredGroup
+    from nanoclaw.core.types import Coworker, RegisteredGroup
     from nanoclaw.ipc.nats_transport import NatsTransport
 
 # Backward-compat aliases
@@ -52,6 +53,7 @@ __all__ = [
     "VolumeMount",
     "build_container_spec",
     "build_volume_mounts",
+    "build_volume_mounts_multi_tenant",
     "write_groups_snapshot",
     "write_tasks_snapshot",
 ]
@@ -72,7 +74,7 @@ def build_volume_mounts(
     is_main: bool,
     backend_config: AgentBackendConfig | None = None,
 ) -> list[VolumeMount]:
-    """Build volume mounts for a container invocation.
+    """Build volume mounts for a container invocation (legacy single-tenant).
 
     Note: creates group session directory and default settings if missing.
     """
@@ -127,8 +129,6 @@ def build_volume_mounts(
             )
 
     # Per-group Claude sessions directory
-    from nanoclaw.core.config import DATA_DIR
-
     group_sessions_dir = DATA_DIR / "sessions" / group.folder / ".claude"
     group_sessions_dir.mkdir(parents=True, exist_ok=True)
     settings_file = group_sessions_dir / "settings.json"
@@ -192,6 +192,118 @@ def build_volume_mounts(
     return mounts
 
 
+def build_volume_mounts_multi_tenant(
+    tenant_id: str,
+    coworker: Coworker,
+    conversation_id: str,
+    is_admin: bool,
+    backend_config: AgentBackendConfig | None = None,
+) -> list[VolumeMount]:
+    """Build volume mounts for multi-tenant container invocation.
+
+    Paths: data/tenants/{tid}/coworkers/{folder}/...
+    """
+    tenant_dir = DATA_DIR / "tenants" / tenant_id
+    coworker_dir = tenant_dir / "coworkers" / coworker.folder
+    shared_dir = tenant_dir / "shared"
+    session_dir = coworker_dir / "sessions" / conversation_id
+
+    # Ensure directories exist
+    (coworker_dir / "workspace").mkdir(parents=True, exist_ok=True)
+    (coworker_dir / "logs").mkdir(parents=True, exist_ok=True)
+    shared_dir.mkdir(parents=True, exist_ok=True)
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    mounts: list[VolumeMount] = [
+        VolumeMount(str(coworker_dir / "workspace"), "/workspace/group", readonly=False),
+        VolumeMount(str(shared_dir), "/workspace/shared", readonly=True),
+        VolumeMount(str(session_dir), "/workspace/sessions", readonly=False),
+        VolumeMount(str(coworker_dir / "logs"), "/workspace/logs", readonly=False),
+    ]
+
+    if is_admin:
+        project_root = PROJECT_ROOT
+        mounts.append(
+            VolumeMount(
+                host_path=str(project_root),
+                container_path="/workspace/project",
+                readonly=True,
+            )
+        )
+        env_file = project_root / ".env"
+        if env_file.exists():
+            mounts.append(
+                VolumeMount(
+                    host_path="/dev/null",
+                    container_path="/workspace/project/.env",
+                    readonly=True,
+                )
+            )
+
+    # Claude session dir
+    claude_dir = coworker_dir / ".claude"
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    settings_file = claude_dir / "settings.json"
+    if not settings_file.exists():
+        settings_file.write_text(
+            json.dumps(
+                {
+                    "env": {
+                        "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+                        "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD": "1",
+                        "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "0",
+                    },
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    # Sync skills
+    skills_src = PROJECT_ROOT / "container" / "skills"
+    skills_dst = claude_dir / "skills"
+    if skills_src.exists():
+        for skill_dir in skills_src.iterdir():
+            if not skill_dir.is_dir():
+                continue
+            dst_dir = skills_dst / skill_dir.name
+            shutil.copytree(str(skill_dir), str(dst_dir), dirs_exist_ok=True)
+
+    mounts.append(
+        VolumeMount(
+            host_path=str(claude_dir),
+            container_path="/home/agent/.claude",
+            readonly=False,
+        )
+    )
+
+    # Additional mounts
+    if coworker.container_config and coworker.container_config.additional_mounts:
+        validated_mounts = validate_additional_mounts(
+            coworker.container_config.additional_mounts,
+            coworker.name,
+            is_admin,
+        )
+        for m in validated_mounts:
+            mounts.append(
+                VolumeMount(
+                    host_path=str(m["host_path"]),
+                    container_path=str(m["container_path"]),
+                    readonly=bool(m["readonly"]),
+                )
+            )
+
+    # Backend config adjustments
+    if backend_config:
+        if backend_config.skip_claude_session:
+            mounts = [m for m in mounts if ".claude" not in m.container_path]
+        for host, container, ro in backend_config.extra_mounts:
+            mounts.append(VolumeMount(host_path=host, container_path=container, readonly=ro))
+
+    return mounts
+
+
 def build_container_spec(
     mounts: list[VolumeMount],
     container_name: str,
@@ -244,6 +356,7 @@ async def write_tasks_snapshot(
     group_folder: str,
     is_main: bool,
     tasks: list[dict[str, object]],
+    tenant_id: str | None = None,
 ) -> None:
     """Write filtered tasks to NATS KV for the agent to read.
 
@@ -253,7 +366,9 @@ async def write_tasks_snapshot(
     filtered_tasks = tasks if is_main else [t for t in tasks if t.get("groupFolder") == group_folder]
 
     kv = await transport.js.key_value("snapshots")
-    await kv.put(f"{group_folder}.tasks", json.dumps(filtered_tasks).encode())
+    # Use tenant prefix if provided
+    key = f"{tenant_id}.{group_folder}.tasks" if tenant_id else f"{group_folder}.tasks"
+    await kv.put(key, json.dumps(filtered_tasks).encode())
 
 
 async def write_groups_snapshot(
@@ -262,6 +377,7 @@ async def write_groups_snapshot(
     is_main: bool,
     groups: list[AvailableGroup],
     _registered_jids: set[str],
+    tenant_id: str | None = None,
 ) -> None:
     """Write available groups snapshot to NATS KV for the agent to read.
 
@@ -282,8 +398,9 @@ async def write_groups_snapshot(
         visible_groups = []
 
     kv = await transport.js.key_value("snapshots")
+    key = f"{tenant_id}.{group_folder}.groups" if tenant_id else f"{group_folder}.groups"
     await kv.put(
-        f"{group_folder}.groups",
+        key,
         json.dumps(
             {
                 "groups": visible_groups,

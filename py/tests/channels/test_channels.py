@@ -45,10 +45,14 @@ def test_slack_factory_returns_none_without_tokens() -> None:
     """Slack factory returns None when tokens are not set."""
     factory = get_channel_factory("slack")
     assert factory is not None
-    from unittest.mock import MagicMock
+    from unittest.mock import MagicMock, patch
 
     opts = MagicMock()
-    result = factory(opts)
+    with (
+        patch("nanoclaw.channels.slack.read_env_file", return_value={}),
+        patch("nanoclaw.channels.slack.os.environ.get", return_value=""),
+    ):
+        result = factory(opts)
     assert result is None
 
 

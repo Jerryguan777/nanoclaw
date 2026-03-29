@@ -75,14 +75,13 @@ async def e2e_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pg_url: str) 
     monkeypatch.setattr("nanoclaw.core.config.IDLE_TIMEOUT", 1000)
     monkeypatch.setattr("nanoclaw.core.config.TIMEZONE", "UTC")
     monkeypatch.setattr("nanoclaw.core.config.ASSISTANT_NAME", "Andy")
-    monkeypatch.setattr("nanoclaw.core.config.TRIGGER_PATTERN", re.compile(r"^@Andy\b", re.IGNORECASE))
 
     # Also patch in modules that import these at module-load time
     monkeypatch.setattr("nanoclaw.core.group_folder.DATA_DIR", data_dir)
     monkeypatch.setattr("nanoclaw.core.group_folder.GROUPS_DIR", groups_dir)
     monkeypatch.setattr("nanoclaw.main.TIMEZONE", "UTC")
     monkeypatch.setattr("nanoclaw.main.ASSISTANT_NAME", "Andy")
-    monkeypatch.setattr("nanoclaw.main.TRIGGER_PATTERN", re.compile(r"^@Andy\b", re.IGNORECASE))
+    monkeypatch.setattr("nanoclaw.main._TRIGGER_PATTERN", re.compile(r"^@Andy\b", re.IGNORECASE))
 
     from nanoclaw.db.pg import _init_test_database
 

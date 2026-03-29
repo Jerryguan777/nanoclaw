@@ -227,7 +227,13 @@ async def process_task_ipc(
                 except (ValueError, TypeError):
                     pass
 
-        await update_task(task_id_val, **updates)
+        await update_task(
+            task_id_val,
+            prompt=updates.get("prompt"),
+            schedule_type=updates.get("schedule_type"),
+            schedule_value=updates.get("schedule_value"),
+            next_run=updates.get("next_run"),
+        )
         logger.info("Task updated via IPC", task_id=task_id_val, source_group=source_group, updates=updates)
         await deps.on_tasks_changed()
 

@@ -63,6 +63,8 @@ omit = [
     "*/nanoclaw/orchestration/remote_control.py",
     "*/nanoclaw/channels/slack.py",
     "*/nanoclaw/channels/telegram.py",
+    "*/nanoclaw/channels/slack_gateway.py",
+    "*/nanoclaw/channels/telegram_gateway.py",
     "*/nanoclaw/agent/container_executor.py",
     "*/nanoclaw/container/docker_runtime.py",
 ]

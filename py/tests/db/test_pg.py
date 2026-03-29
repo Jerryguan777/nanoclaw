@@ -274,6 +274,182 @@ async def test_store_message_direct() -> None:
     assert len(msgs) == 1
 
 
+async def test_multi_tenant_crud() -> None:
+    """Test tenant, role, coworker, channel binding, and conversation CRUD."""
+    from nanoclaw.db.pg import (
+        create_channel_binding,
+        create_conversation,
+        create_coworker,
+        create_role,
+        create_tenant,
+        create_user,
+        get_all_channel_bindings,
+        get_all_conversations,
+        get_all_coworkers,
+        get_all_tenants,
+        get_channel_binding,
+        get_channel_bindings_for_coworker,
+        get_conversation,
+        get_conversation_by_binding_chat,
+        get_conversations_for_coworker,
+        get_coworker,
+        get_coworkers_for_tenant,
+        get_role,
+        get_roles_for_tenant,
+        get_tenant,
+        get_tenant_by_slug,
+        get_users_for_tenant,
+    )
+
+    # Tenant
+    tenant = await create_tenant(slug="acme", name="Acme Corp")
+    assert tenant.slug == "acme"
+    assert tenant.plan == "starter"
+
+    t = await get_tenant(tenant.id)
+    assert t is not None
+    assert t.name == "Acme Corp"
+
+    t_by_slug = await get_tenant_by_slug("acme")
+    assert t_by_slug is not None
+    assert t_by_slug.id == tenant.id
+
+    all_tenants = await get_all_tenants()
+    assert any(t.id == tenant.id for t in all_tenants)
+
+    # User
+    user = await create_user(tenant_id=tenant.id, name="Alice", email="alice@acme.com", role="admin")
+    assert user.name == "Alice"
+    assert user.role == "admin"
+
+    users = await get_users_for_tenant(tenant.id)
+    assert len(users) == 1
+
+    # Role
+    role = await create_role(
+        tenant_id=tenant.id,
+        name="General",
+        role_type="general",
+        system_prompt="Be helpful",
+        tools=["browser"],
+    )
+    assert role.name == "General"
+    assert role.tools == ["browser"]
+
+    r = await get_role(role.id)
+    assert r is not None
+    assert r.system_prompt == "Be helpful"
+
+    roles = await get_roles_for_tenant(tenant.id)
+    assert len(roles) == 1
+
+    # Coworker
+    coworker = await create_coworker(
+        tenant_id=tenant.id,
+        role_id=role.id,
+        name="Ops AI",
+        folder="ops-ai",
+        is_admin=True,
+    )
+    assert coworker.name == "Ops AI"
+    assert coworker.is_admin is True
+
+    cw = await get_coworker(coworker.id)
+    assert cw is not None
+    assert cw.folder == "ops-ai"
+
+    cws = await get_coworkers_for_tenant(tenant.id)
+    assert len(cws) == 1
+
+    all_cws = await get_all_coworkers()
+    assert any(c.id == coworker.id for c in all_cws)
+
+    # Channel Binding
+    binding = await create_channel_binding(
+        coworker_id=coworker.id,
+        tenant_id=tenant.id,
+        channel_type="telegram",
+        credentials={"bot_token": "test-token"},
+    )
+    assert binding.channel_type == "telegram"
+    assert binding.credentials["bot_token"] == "test-token"
+
+    b = await get_channel_binding(binding.id)
+    assert b is not None
+
+    bs = await get_channel_bindings_for_coworker(coworker.id)
+    assert len(bs) == 1
+
+    all_bs = await get_all_channel_bindings(tenant.id)
+    assert len(all_bs) == 1
+
+    # Conversation
+    conv = await create_conversation(
+        tenant_id=tenant.id,
+        coworker_id=coworker.id,
+        channel_binding_id=binding.id,
+        channel_chat_id="12345",
+        name="Test Group",
+        trigger_pattern="@Ops",
+        is_main=True,
+    )
+    assert conv.channel_chat_id == "12345"
+    assert conv.is_main is True
+
+    c = await get_conversation(conv.id)
+    assert c is not None
+    assert c.name == "Test Group"
+
+    cs = await get_conversations_for_coworker(coworker.id)
+    assert len(cs) == 1
+
+    c_by_bc = await get_conversation_by_binding_chat(binding.id, "12345")
+    assert c_by_bc is not None
+    assert c_by_bc.id == conv.id
+
+    all_convs = await get_all_conversations(tenant.id)
+    assert len(all_convs) == 1
+
+
+async def test_session_new_format() -> None:
+    """Test set_session_new for multi-tenant sessions."""
+    from nanoclaw.db.pg import (
+        create_channel_binding,
+        create_conversation,
+        create_coworker,
+        create_role,
+        create_tenant,
+        set_session_new,
+    )
+
+    tenant = await create_tenant(slug="sesstest", name="Sess Test")
+    role = await create_role(tenant_id=tenant.id, name="general", role_type="general")
+    coworker = await create_coworker(
+        tenant_id=tenant.id, role_id=role.id, name="Test", folder="sesstest"
+    )
+    binding = await create_channel_binding(
+        coworker_id=coworker.id, tenant_id=tenant.id, channel_type="telegram"
+    )
+    conv = await create_conversation(
+        tenant_id=tenant.id,
+        coworker_id=coworker.id,
+        channel_binding_id=binding.id,
+        channel_chat_id="99999",
+    )
+
+    await set_session_new(conv.id, tenant.id, coworker.id, "session-xyz")
+    # Verify it was stored (using the session table)
+    from nanoclaw.db.pg import _get_pool
+
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT session_id FROM sessions WHERE conversation_id = $1::uuid", conv.id
+        )
+    assert row is not None
+    assert row["session_id"] == "session-xyz"
+
+
 async def test_registered_group_with_config() -> None:
     from nanoclaw.core.types import ContainerConfig
 

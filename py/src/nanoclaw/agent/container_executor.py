@@ -132,6 +132,8 @@ class ContainerAgentExecutor:
             assistant_name=inp.assistant_name,
             system_prompt=inp.system_prompt,
             role_config=inp.role_config,
+            tenant_id=inp.tenant_id,
+            coworker_id=inp.coworker_id,
         )
         await kv_init.put(job_id, agent_init.serialize())
 

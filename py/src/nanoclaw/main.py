@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import re as _re
 import signal
 import sys
 from typing import TYPE_CHECKING
@@ -27,22 +28,33 @@ from nanoclaw.container.scheduler import GroupQueue
 from nanoclaw.core.config import (
     ASSISTANT_NAME,
     CREDENTIAL_PROXY_PORT,
+    GLOBAL_MAX_CONTAINERS,
     IDLE_TIMEOUT,
     NATS_URL,
     POLL_INTERVAL,
     TIMEZONE,
-    TRIGGER_PATTERN,
 )
 from nanoclaw.core.group_folder import resolve_group_folder_path
 from nanoclaw.core.logger import get_logger
+from nanoclaw.core.orchestrator_state import (
+    ConversationState,
+    CoworkerConfig,
+    CoworkerState,
+    OrchestratorState,
+)
 from nanoclaw.db.pg import (
     close_database,
     get_all_chats,
+    get_all_coworkers,
     get_all_registered_groups,
     get_all_sessions,
     get_all_tasks,
+    get_all_tenants,
+    get_channel_bindings_for_coworker,
+    get_conversations_for_coworker,
     get_messages_since,
     get_new_messages,
+    get_role,
     get_router_state,
     init_database,
     set_registered_group,
@@ -94,6 +106,15 @@ _runtime: ContainerRuntime | None = None
 _executor: ContainerAgentExecutor | None = None
 _bg_tasks: set[asyncio.Task[None]] = set()
 
+# Multi-tenant runtime state
+_orch_state: OrchestratorState = OrchestratorState(global_limit=GLOBAL_MAX_CONTAINERS)
+
+# Trigger pattern (legacy, built from ASSISTANT_NAME)
+_TRIGGER_PATTERN: _re.Pattern[str] = _re.compile(
+    rf"^@{_re.escape(ASSISTANT_NAME)}\b",
+    _re.IGNORECASE,
+)
+
 
 # ---------------------------------------------------------------------------
 # State persistence
@@ -114,6 +135,46 @@ async def _load_state() -> None:
     _sessions = await get_all_sessions()
     _registered_groups = await get_all_registered_groups()
     logger.info("State loaded", group_count=len(_registered_groups))
+
+    # Load multi-tenant state
+    await _load_multi_tenant_state()
+
+
+async def _load_multi_tenant_state() -> None:
+    """Load tenants, coworkers, bindings, and conversations into OrchestratorState."""
+    tenants = await get_all_tenants()
+    for t in tenants:
+        _orch_state.tenants[t.id] = t
+
+    coworkers = await get_all_coworkers()
+    for cw in coworkers:
+        role = await get_role(cw.role_id)
+        if role is None:
+            logger.warning("Coworker has missing role, skipping", coworker_id=cw.id, role_id=cw.role_id)
+            continue
+
+        config = CoworkerConfig.from_role_and_coworker(role, cw)
+        cw_state = CoworkerState(config=config)
+
+        # Load channel bindings
+        bindings = await get_channel_bindings_for_coworker(cw.id)
+        for b in bindings:
+            cw_state.channel_bindings[b.channel_type] = b
+
+        # Load conversations
+        conversations = await get_conversations_for_coworker(cw.id)
+        for conv in conversations:
+            cw_state.conversations[conv.channel_chat_id] = ConversationState(
+                conversation=conv,
+            )
+
+        _orch_state.coworkers[cw.id] = cw_state
+
+    logger.info(
+        "Multi-tenant state loaded",
+        tenant_count=len(_orch_state.tenants),
+        coworker_count=len(_orch_state.coworkers),
+    )
 
 
 async def _save_state() -> None:
@@ -265,7 +326,7 @@ async def _process_group_messages(chat_jid: str) -> bool:
     if not is_main_group and group.requires_trigger is not False:
         allowlist_cfg = load_sender_allowlist()
         has_trigger = any(
-            TRIGGER_PATTERN.search(m.content.strip())
+            _TRIGGER_PATTERN.search(m.content.strip())
             and (m.is_from_me or is_trigger_allowed(chat_jid, m.sender, allowlist_cfg))
             for m in missed_messages
         )
@@ -473,7 +534,7 @@ async def _message_loop(shutdown_event: asyncio.Event) -> None:
                     if needs_trigger:
                         allowlist_cfg = load_sender_allowlist()
                         has_trigger = any(
-                            TRIGGER_PATTERN.search(m.content.strip())
+                            _TRIGGER_PATTERN.search(m.content.strip())
                             and (m.is_from_me or is_trigger_allowed(chat_jid, m.sender, allowlist_cfg))
                             for m in group_messages
                         )
@@ -595,7 +656,7 @@ async def main() -> None:
         lambda: _registered_groups,
     )
 
-    _queue = GroupQueue(transport=_transport, runtime=_runtime)
+    _queue = GroupQueue(transport=_transport, runtime=_runtime, orchestrator_state=_orch_state)
 
     proxy_runner = await start_credential_proxy(CREDENTIAL_PROXY_PORT, PROXY_BIND_HOST)
 
