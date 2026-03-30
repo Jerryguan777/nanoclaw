@@ -373,6 +373,7 @@ async def run_query(
     js: JetStreamContext,
     job_id: str,
     resume_at: str | None = None,
+    coworker_system_prompt: str | None = None,
 ) -> QueryResult:
     stream = MessageStream()
     stream.push(prompt)
@@ -431,8 +432,8 @@ async def run_query(
     # Build system prompt from coworker config + global CLAUDE.md
     system_prompt: dict[str, Any] | None = None
     append_parts: list[str] = []
-    if init.system_prompt:
-        append_parts.append(init.system_prompt)
+    if coworker_system_prompt:
+        append_parts.append(coworker_system_prompt)
     if global_claude_md:
         append_parts.append(global_claude_md)
     if append_parts:
@@ -646,6 +647,7 @@ async def main() -> None:
                 js,
                 JOB_ID,
                 resume_at,
+                coworker_system_prompt=init.system_prompt,
             )
             if query_result.new_session_id:
                 session_id = query_result.new_session_id
