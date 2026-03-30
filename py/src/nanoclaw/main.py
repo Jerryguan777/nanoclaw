@@ -475,23 +475,36 @@ async def _start_nats_ipc_subscriptions(transport: NatsTransport, deps: _IpcDeps
                                 break
                     is_main = source_cw.config.is_admin if source_cw else False
 
-                    # Authorization: admin can send anywhere, others only to own conversations
-                    authorized = is_main
-                    if not authorized and source_cw:
+                    # Skip if agent is sending to its own conversation —
+                    # the results stream (_on_output) already handles that.
+                    # IPC send_message is only for cross-chat messages.
+                    is_own_chat = False
+                    if source_cw:
                         for conv in source_cw.conversations.values():
                             if conv.conversation.channel_chat_id == chat_jid:
-                                authorized = True
+                                is_own_chat = True
                                 break
 
-                    if authorized:
-                        await _send_via_coworker(source_cw, chat_jid, data["text"])
-                        logger.info("NATS IPC message sent", chat_jid=chat_jid, source_group=source_group)
-                    else:
-                        logger.warning(
-                            "Unauthorized IPC message attempt blocked",
+                    if is_own_chat:
+                        logger.debug(
+                            "IPC send_message to own chat skipped (results stream handles it)",
                             chat_jid=chat_jid,
                             source_group=source_group,
                         )
+                    else:
+                        # Cross-chat message: admin can send anywhere, others blocked
+                        authorized = is_main
+                        if authorized:
+                            await _send_via_coworker(source_cw, chat_jid, data["text"])
+                            logger.info(
+                                "NATS IPC cross-chat message sent", chat_jid=chat_jid, source_group=source_group
+                            )
+                        else:
+                            logger.warning(
+                                "Unauthorized IPC cross-chat message blocked",
+                                chat_jid=chat_jid,
+                                source_group=source_group,
+                            )
                 await msg.ack()
             except Exception:
                 logger.exception("Error processing NATS IPC message")
