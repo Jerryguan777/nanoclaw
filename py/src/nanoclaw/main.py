@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import re
 import signal
 import sys
 from typing import TYPE_CHECKING
@@ -104,6 +105,25 @@ _message_loop_running: bool = False
 
 _gateways: dict[str, ChannelGateway] = {}
 _queue: GroupQueue = GroupQueue()
+
+
+def _coworker_from_state(cw_state: CoworkerState) -> Coworker:
+    """Build a full Coworker dataclass from runtime CoworkerState."""
+    c = cw_state.config
+    return Coworker(
+        id=c.id,
+        tenant_id=c.tenant_id,
+        name=c.name,
+        folder=c.folder,
+        agent_backend=c.agent_backend,
+        system_prompt=c.system_prompt,
+        tools=c.tools,
+        skills=c.skills,
+        is_admin=c.is_admin,
+        max_concurrent=c.max_concurrent,
+    )
+
+
 _transport: NatsTransport | None = None
 _runtime: ContainerRuntime | None = None
 _executor: ContainerAgentExecutor | None = None
@@ -255,6 +275,7 @@ async def _handle_incoming(
 
 async def _process_conversation_messages(conversation_id: str) -> bool:
     """Process all pending messages for a conversation (identified by conversation_id)."""
+    _ipc_sent_texts.clear()  # Reset dedup set for each processing cycle
     found = _state.get_conversation(conversation_id)
     if not found:
         return True
@@ -317,8 +338,6 @@ async def _process_conversation_messages(conversation_id: str) -> bool:
     async def _on_output(result: AgentOutput) -> None:
         nonlocal had_error, output_sent_to_user
         if result.result:
-            import re
-
             raw = result.result
             text = re.sub(r"<internal>[\s\S]*?</internal>", "", raw).strip()
             logger.info("Agent output", coworker=config.name, chars=len(raw))
@@ -769,16 +788,7 @@ async def main() -> None:
 
     def _get_coworker(coworker_id: str) -> Coworker | None:
         cw = _state.coworkers.get(coworker_id)
-        if cw is None:
-            return None
-        return Coworker(
-            id=cw.config.id,
-            tenant_id=cw.config.tenant_id,
-            name=cw.config.name,
-            folder=cw.config.folder,
-            is_admin=cw.config.is_admin,
-            max_concurrent=cw.config.max_concurrent,
-        )
+        return _coworker_from_state(cw) if cw else None
 
     _executor = ContainerAgentExecutor(
         CLAUDE_CODE_BACKEND,
@@ -855,16 +865,7 @@ class _SchedulerDepsImpl:
 
     def get_coworker(self, coworker_id: str) -> Coworker | None:
         cw = _state.coworkers.get(coworker_id)
-        if cw is None:
-            return None
-        return Coworker(
-            id=cw.config.id,
-            tenant_id=cw.config.tenant_id,
-            name=cw.config.name,
-            folder=cw.config.folder,
-            is_admin=cw.config.is_admin,
-            max_concurrent=cw.config.max_concurrent,
-        )
+        return _coworker_from_state(cw) if cw else None
 
     def get_session(self, conversation_id: str) -> str | None:
         for cw in _state.coworkers.values():
@@ -914,16 +915,7 @@ class _IpcDepsImpl:
 
     async def get_coworker_by_folder(self, tenant_id: str, folder: str) -> Coworker | None:
         cw = _state.get_coworker_by_folder(tenant_id, folder)
-        if cw is None:
-            return None
-        return Coworker(
-            id=cw.config.id,
-            tenant_id=cw.config.tenant_id,
-            name=cw.config.name,
-            folder=cw.config.folder,
-            is_admin=cw.config.is_admin,
-            max_concurrent=cw.config.max_concurrent,
-        )
+        return _coworker_from_state(cw) if cw else None
 
     async def get_channel_binding_for_coworker(self, coworker_id: str, channel_type: str) -> ChannelBinding | None:
         cw = _state.coworkers.get(coworker_id)

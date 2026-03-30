@@ -800,21 +800,6 @@ async def store_message(
         )
 
 
-async def store_message_from_new_message(msg: NewMessage, tenant_id: str, conversation_id: str) -> None:
-    """Store a NewMessage object (convenience wrapper)."""
-    await store_message(
-        tenant_id=tenant_id,
-        conversation_id=conversation_id,
-        msg_id=msg.id,
-        sender=msg.sender,
-        sender_name=msg.sender_name,
-        content=msg.content,
-        timestamp=msg.timestamp,
-        is_from_me=msg.is_from_me,
-        is_bot_message=msg.is_bot_message,
-    )
-
-
 def _record_to_new_message(row: asyncpg.Record, chat_jid: str = "") -> NewMessage:
     """Convert an asyncpg.Record to a NewMessage dataclass."""
     ts = row["timestamp"]
@@ -1162,23 +1147,6 @@ def _parse_registered_group_record(
         requires_trigger=requires_trigger,
         is_main=is_main,
     )
-
-
-async def get_registered_group(jid: str) -> RegisteredGroup | None:
-    """Get a registered group by JID, or None if not found / invalid folder."""
-    pool = _get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT * FROM registered_groups WHERE tenant_id = $1 AND jid = $2",
-            DEFAULT_TENANT,
-            jid,
-        )
-    if row is None:
-        return None
-    result = _parse_registered_group_record(row)
-    if result is None:
-        return None
-    return result[1]
 
 
 async def set_registered_group(jid: str, group: RegisteredGroup) -> None:
