@@ -48,10 +48,14 @@ class _BotInstance:
         self._bot_username: str | None = None
         # All binding IDs served by this bot instance
         self._binding_ids: list[str] = []
+        # binding_id -> display name (coworker name) for @mention translation
+        self._display_names: dict[str, str] = {}
 
-    def add_binding_id(self, binding_id: str) -> None:
+    def add_binding_id(self, binding_id: str, display_name: str | None = None) -> None:
         if binding_id not in self._binding_ids:
             self._binding_ids.append(binding_id)
+        if display_name:
+            self._display_names[binding_id] = display_name
 
     def remove_binding_id(self, binding_id: str) -> None:
         if binding_id in self._binding_ids:
@@ -85,18 +89,24 @@ class _BotInstance:
             msg_id = str(msg.message_id)
             is_group = chat.type in ("group", "supergroup")
 
-            # Translate @bot_username mentions
+            # Translate @bot_username mentions to @display_name for trigger matching
+            has_bot_mention = False
             if self._bot_username and msg.entities:
                 for entity in msg.entities:
                     if entity.type == "mention":
                         mention_text = content[entity.offset : entity.offset + entity.length].lower()
                         if mention_text == f"@{self._bot_username.lower()}":
-                            content = f"@{self._bot_username} {content}"
+                            has_bot_mention = True
                             break
 
             # Dispatch to ALL bindings sharing this token
             for bid in self._binding_ids:
-                await self._on_message(bid, chat_id, sender, sender_name, content, timestamp, msg_id, is_group)
+                # Per-binding content: translate @bot_username to @coworker_name
+                bid_content = content
+                if has_bot_mention:
+                    display_name = self._display_names.get(bid, self._bot_username or "")
+                    bid_content = f"@{display_name} {content}"
+                await self._on_message(bid, chat_id, sender, sender_name, bid_content, timestamp, msg_id, is_group)
 
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text))
 
@@ -238,7 +248,7 @@ class TelegramGateway:
         existing_bot = self._bots_by_token.get(token)
         if existing_bot is not None:
             # Reuse existing bot instance — just register this binding_id
-            existing_bot.add_binding_id(binding.id)
+            existing_bot.add_binding_id(binding.id, binding.bot_display_name)
             logger.info(
                 "Telegram binding added to existing bot",
                 binding_id=binding.id,
@@ -248,7 +258,7 @@ class TelegramGateway:
 
         # New token — create new bot instance
         bot = _BotInstance(token, self._on_message)
-        bot.add_binding_id(binding.id)
+        bot.add_binding_id(binding.id, binding.bot_display_name)
         self._bots_by_token[token] = bot
         await bot.start()
 
