@@ -91,6 +91,7 @@ from nanoclaw.security.sender_allowlist import (
 
 if TYPE_CHECKING:
     from nanoclaw.container.runtime import ContainerRuntime
+    from nanoclaw.core.types import NewMessage
 
 logger = get_logger()
 
@@ -175,10 +176,11 @@ async def _load_state() -> None:
         for b in bindings_by_coworker.get(cw.id, []):
             cw_state.channel_bindings[b.channel_type] = b
 
-        # Load conversations
+        # Load conversations (keyed by conversation ID, not chat_id,
+        # because the same chat_id may appear under different bindings)
         for conv in convs_by_coworker.get(cw.id, []):
             session_id = all_sessions.get(conv.id)
-            cw_state.conversations[conv.channel_chat_id] = ConversationState(
+            cw_state.conversations[conv.id] = ConversationState(
                 conversation=conv,
                 session_id=session_id,
                 last_agent_timestamp=conv.last_agent_invocation or "",
@@ -241,16 +243,9 @@ async def _handle_incoming(
 # ---------------------------------------------------------------------------
 
 
-async def _process_conversation_messages(chat_id: str) -> bool:
-    """Process all pending messages for a conversation (identified by chat_id)."""
-    # Find the conversation
-    found = None
-    for cw in _state.coworkers.values():
-        conv_state = cw.conversations.get(chat_id)
-        if conv_state:
-            found = (cw, conv_state)
-            break
-
+async def _process_conversation_messages(conversation_id: str) -> bool:
+    """Process all pending messages for a conversation (identified by conversation_id)."""
+    found = _state.get_conversation(conversation_id)
     if not found:
         return True
 
@@ -295,7 +290,7 @@ async def _process_conversation_messages(chat_id: str) -> bool:
         loop = asyncio.get_running_loop()
         idle_handle = loop.call_later(
             IDLE_TIMEOUT / 1000.0,
-            lambda: _queue.close_stdin(chat_id),
+            lambda: _queue.close_stdin(conversation_id),
         )
 
     # Set typing
@@ -324,7 +319,7 @@ async def _process_conversation_messages(chat_id: str) -> bool:
                     output_sent_to_user = True
             _reset_idle_timer()
         if result.status == "success":
-            _queue.notify_idle(chat_id)
+            _queue.notify_idle(conversation_id)
         if result.status == "error":
             had_error = True
 
@@ -424,7 +419,7 @@ async def _run_agent(
                 conversation_id=conv.id,
             ),
             lambda handle, container_name, job_id: _queue.register_process(
-                conv.channel_chat_id, handle, container_name, config.folder, job_id
+                conv.id, handle, container_name, config.folder, job_id
             ),
             wrapped_on_output,
         )
@@ -555,93 +550,94 @@ async def _message_loop(shutdown_event: asyncio.Event) -> None:
 
     logger.info("NanoClaw running (multi-tenant)")
 
-    # Get default tenant for message cursor
-    default_tenant = await get_tenant_by_slug("default")
-    last_timestamp = default_tenant.last_message_cursor if default_tenant and default_tenant.last_message_cursor else ""
+    # Per-tenant message cursors
+    last_timestamps: dict[str, str] = {}
+    for t in _state.tenants.values():
+        last_timestamps[t.id] = t.last_message_cursor or ""
 
     while not shutdown_event.is_set():
         try:
-            # Collect all conversation IDs
-            conv_ids: list[str] = []
+            # Collect conversations grouped by tenant
+            convs_by_tenant: dict[str, list[str]] = {}
             conv_lookup: dict[str, tuple[CoworkerState, ConversationState]] = {}
             for cw in _state.coworkers.values():
                 for cs in cw.conversations.values():
-                    conv_ids.append(cs.conversation.id)
+                    tid = cs.conversation.tenant_id
+                    convs_by_tenant.setdefault(tid, []).append(cs.conversation.id)
                     conv_lookup[cs.conversation.id] = (cw, cs)
 
-            if conv_ids and default_tenant:
-                results = await get_new_messages_for_conversations(
-                    default_tenant.id, conv_ids, last_timestamp, ASSISTANT_NAME
-                )
+            # Query each tenant's messages
+            results: list[tuple[str, NewMessage]] = []
+            for tid, conv_ids in convs_by_tenant.items():
+                last_ts = last_timestamps.get(tid, "")
+                tenant_results = await get_new_messages_for_conversations(tid, conv_ids, last_ts, ASSISTANT_NAME)
+                if tenant_results:
+                    results.extend(tenant_results)
+                    new_ts = max(msg.timestamp for _, msg in tenant_results)
+                    if new_ts > last_ts:
+                        last_timestamps[tid] = new_ts
+                        await update_tenant_message_cursor(tid, new_ts)
 
-                if results:
-                    logger.info("New messages", count=len(results))
+            if results:
+                logger.info("New messages", count=len(results))
 
-                    # Update cursor
-                    new_ts = max(msg.timestamp for _, msg in results)
-                    if new_ts > last_timestamp:
-                        last_timestamp = new_ts
-                        await update_tenant_message_cursor(default_tenant.id, last_timestamp)
+                # Group by conversation
+                by_conv: dict[str, list[tuple[CoworkerState, ConversationState]]] = {}
+                for conv_id, _msg in results:
+                    if conv_id not in by_conv:
+                        by_conv[conv_id] = []
+                    if conv_id in conv_lookup:
+                        by_conv[conv_id] = [conv_lookup[conv_id]]
 
-                    # Group by conversation
-                    by_conv: dict[str, list[tuple[CoworkerState, ConversationState]]] = {}
-                    for conv_id, _msg in results:
-                        if conv_id not in by_conv:
-                            by_conv[conv_id] = []
-                        if conv_id in conv_lookup:
-                            by_conv[conv_id] = [conv_lookup[conv_id]]
+                for conv_id, entries in by_conv.items():
+                    if not entries:
+                        continue
+                    cw_state, conv_state = entries[0]
+                    config = cw_state.config
+                    conv = conv_state.conversation
+                    chat_id = conv.channel_chat_id
 
-                    for conv_id, entries in by_conv.items():
-                        if not entries:
-                            continue
-                        cw_state, conv_state = entries[0]
-                        config = cw_state.config
-                        conv = conv_state.conversation
-                        chat_id = conv.channel_chat_id
+                    is_admin = config.is_admin
+                    needs_trigger = not is_admin and conv.requires_trigger
 
-                        is_admin = config.is_admin
-                        needs_trigger = not is_admin and conv.requires_trigger
-
-                        if needs_trigger:
-                            # Check if any message triggers the agent
-                            conv_messages = [msg for cid, msg in results if cid == conv_id]
-                            allowlist_cfg = load_sender_allowlist()
-                            has_trigger = any(
-                                config.trigger_pattern.search(m.content.strip())
-                                and (m.is_from_me or is_trigger_allowed(chat_id, m.sender, allowlist_cfg))
-                                for m in conv_messages
-                            )
-                            if not has_trigger:
-                                continue
-
-                        # Try piping to active container first
-                        all_pending = await get_messages_since(
-                            conv.tenant_id,
-                            conv.id,
-                            conv_state.last_agent_timestamp,
-                            config.name,
-                            chat_jid=chat_id,
+                    if needs_trigger:
+                        conv_messages = [msg for cid, msg in results if cid == conv_id]
+                        allowlist_cfg = load_sender_allowlist()
+                        has_trigger = any(
+                            config.trigger_pattern.search(m.content.strip())
+                            and (m.is_from_me or is_trigger_allowed(chat_id, m.sender, allowlist_cfg))
+                            for m in conv_messages
                         )
-                        if all_pending:
-                            formatted = format_messages(all_pending, TIMEZONE)
-                            if _queue.send_message(chat_id, formatted):
-                                logger.debug("Piped messages to active container", chat_id=chat_id)
-                                conv_state.last_agent_timestamp = all_pending[-1].timestamp
-                                await update_conversation_last_invocation(conv.id, all_pending[-1].timestamp)
+                        if not has_trigger:
+                            continue
 
-                                # Set typing
-                                binding = cw_state.channel_bindings.get(_get_channel_type_for_chat(chat_id))
-                                if binding:
-                                    gw = _gateways.get(_get_channel_type_for_chat(chat_id))
-                                    if gw:
-                                        with contextlib.suppress(OSError, RuntimeError, TypeError, ValueError):
-                                            await gw.set_typing(binding.id, chat_id, True)
-                            else:
-                                _queue.enqueue_message_check(
-                                    chat_id,
-                                    tenant_id=config.tenant_id,
-                                    coworker_id=config.id,
-                                )
+                    # Try piping to active container first
+                    all_pending = await get_messages_since(
+                        conv.tenant_id,
+                        conv.id,
+                        conv_state.last_agent_timestamp,
+                        config.name,
+                        chat_jid=chat_id,
+                    )
+                    if all_pending:
+                        formatted = format_messages(all_pending, TIMEZONE)
+                        if _queue.send_message(conv_id, formatted):
+                            logger.debug("Piped messages to active container", conv_id=conv_id)
+                            conv_state.last_agent_timestamp = all_pending[-1].timestamp
+                            await update_conversation_last_invocation(conv.id, all_pending[-1].timestamp)
+
+                            binding = cw_state.channel_bindings.get(_get_channel_type_for_chat(chat_id))
+                            if binding:
+                                gw = _gateways.get(_get_channel_type_for_chat(chat_id))
+                                if gw:
+                                    with contextlib.suppress(OSError, RuntimeError, TypeError, ValueError):
+                                        await gw.set_typing(binding.id, chat_id, True)
+                        else:
+                            _queue.enqueue_message_check(
+                                conv_id,
+                                tenant_id=config.tenant_id,
+                                coworker_id=config.id,
+                            )
         except (OSError, RuntimeError, TypeError, ValueError):
             logger.exception("Error in message loop")
 
@@ -669,7 +665,7 @@ async def _recover_pending_messages() -> None:
                     pending_count=len(pending),
                 )
                 _queue.enqueue_message_check(
-                    conv.channel_chat_id,
+                    conv.id,
                     tenant_id=cw.config.tenant_id,
                     coworker_id=cw.config.id,
                 )
@@ -946,10 +942,10 @@ class _IpcDepsImpl:
             name=name,
             requires_trigger=True,
         )
-        # Add to runtime state
+        # Add to runtime state (keyed by conversation ID)
         cw = _state.coworkers.get(coworker_id)
         if cw:
-            cw.conversations[channel_chat_id] = ConversationState(conversation=conv)
+            cw.conversations[conv.id] = ConversationState(conversation=conv)
         return conv
 
     async def sync_groups(self, force: bool) -> None:

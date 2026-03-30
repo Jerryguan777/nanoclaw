@@ -154,7 +154,7 @@ def _build_coworker_state(
     state = CoworkerState(config=config)
     state.channel_bindings[binding.channel_type] = binding
     for conv in conversations:
-        state.conversations[conv.channel_chat_id] = ConversationState(conversation=conv)
+        state.conversations[conv.id] = ConversationState(conversation=conv)
     return state
 
 
@@ -380,7 +380,7 @@ class TestTwoCoworkersSameGroup:
 
         import nanoclaw.main as m
 
-        result = await m._process_conversation_messages("-1001000")
+        result = await m._process_conversation_messages(ops_convs[0].id)
         assert result is True
 
         # Ops Bot should have been invoked
@@ -416,7 +416,7 @@ class TestTwoCoworkersSameGroup:
 
         import nanoclaw.main as m
 
-        result = await m._process_conversation_messages("-1002000")
+        result = await m._process_conversation_messages(ops_convs[0].id)
         assert result is True
         assert len(executor.executions) == 0  # Neither bot invoked
 
@@ -448,7 +448,7 @@ class TestTwoCoworkersSameGroup:
 
         import nanoclaw.main as m
 
-        result = await m._process_conversation_messages("-1003000")
+        result = await m._process_conversation_messages(admin_convs[0].id)
         assert result is True
         assert len(executor.executions) == 1
         assert gateway.sent[0].text == "I'm the admin bot!"
@@ -505,11 +505,11 @@ class TestSessionIsolation:
 
         import nanoclaw.main as m
 
-        await m._process_conversation_messages("-100A")
+        await m._process_conversation_messages(convs[0].id)
 
         # Message in Group B
         await _inject_message(tenant.id, convs[1].id, "Task B", timestamp="2024-06-01T12:00:02+00:00")
-        await m._process_conversation_messages("-100B")
+        await m._process_conversation_messages(convs[1].id)
 
         # Sessions should be different
         from nanoclaw.db.pg import get_session
@@ -547,9 +547,9 @@ class TestSessionIsolation:
 
         import nanoclaw.main as m
 
-        await m._process_conversation_messages("-200B")
+        await m._process_conversation_messages(convs[1].id)
         # Group B cursor should be advanced
-        b_cursor = state.coworkers[cw.id].conversations["-200B"].last_agent_timestamp
+        b_cursor = state.coworkers[cw.id].conversations[convs[1].id].last_agent_timestamp
         assert b_cursor != ""
 
         # Now: fail in Group A
@@ -557,15 +557,15 @@ class TestSessionIsolation:
         m._executor = fail_executor  # type: ignore[assignment]
 
         await _inject_message(tenant.id, convs[0].id, "This will fail", timestamp="2024-06-01T12:00:02+00:00")
-        result = await m._process_conversation_messages("-200A")
+        result = await m._process_conversation_messages(convs[0].id)
         assert result is False  # Failure → retry
 
         # Group A cursor should be rolled back
-        a_cursor = state.coworkers[cw.id].conversations["-200A"].last_agent_timestamp
+        a_cursor = state.coworkers[cw.id].conversations[convs[0].id].last_agent_timestamp
         assert a_cursor == ""  # Rolled back to initial
 
         # Group B cursor should NOT be affected
-        b_cursor_after = state.coworkers[cw.id].conversations["-200B"].last_agent_timestamp
+        b_cursor_after = state.coworkers[cw.id].conversations[convs[1].id].last_agent_timestamp
         assert b_cursor_after == b_cursor  # Unchanged
 
 
@@ -1299,7 +1299,7 @@ class TestOrchestratorStateLookups:
         )
         cw_state = CoworkerState(config=config)
         cw_state.channel_bindings["telegram"] = binding
-        cw_state.conversations["-1001"] = ConversationState(conversation=conv)
+        cw_state.conversations["conv1"] = ConversationState(conversation=conv)
         state.coworkers["cw1"] = cw_state
 
         result = state.find_conversation_by_binding_and_chat("b1", "-1001")
