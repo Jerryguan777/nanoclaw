@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -38,17 +37,6 @@ def _to_dt(ts: str | None) -> datetime | None:
 
 _pool: asyncpg.Pool[asyncpg.Record] | None = None
 DEFAULT_TENANT: str = "default"
-
-
-@dataclass(frozen=True)
-class ChatInfo:
-    """Chat metadata record."""
-
-    jid: str
-    name: str
-    last_message_time: str
-    channel: str | None
-    is_group: bool
 
 
 def _get_pool() -> asyncpg.Pool[asyncpg.Record]:
@@ -215,19 +203,6 @@ async def _create_schema(conn: asyncpg.pool.PoolConnectionProxy[asyncpg.Record])
             )
         """)
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_task_run_logs ON task_run_logs(task_id, run_at)")
-
-    # --- Legacy table: chats (still used by legacy channel implementations) ---
-    await conn.execute("""
-        CREATE TABLE IF NOT EXISTS chats (
-            tenant_id TEXT NOT NULL DEFAULT 'default',
-            jid TEXT NOT NULL,
-            name TEXT,
-            last_message_time TEXT,
-            channel TEXT,
-            is_group BOOLEAN DEFAULT FALSE,
-            PRIMARY KEY (tenant_id, jid)
-        )
-    """)
 
 
 async def init_database(database_url: str | None = None) -> None:
@@ -1184,129 +1159,6 @@ async def log_task_run(log: TaskRunLog) -> None:
             log.status,
             log.result[:500] if log.result else log.result,
             log.error,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Chat metadata (legacy — used during migration)
-# ---------------------------------------------------------------------------
-
-
-async def store_chat_metadata(
-    chat_jid: str,
-    timestamp: str,
-    name: str | None = None,
-    channel: str | None = None,
-    is_group: bool | None = None,
-) -> None:
-    """Store chat metadata only (no message content). Legacy."""
-    pool = _get_pool()
-    async with pool.acquire() as conn:
-        if name:
-            await conn.execute(
-                """
-                INSERT INTO chats (tenant_id, jid, name, last_message_time, channel, is_group)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                ON CONFLICT (tenant_id, jid) DO UPDATE SET
-                    name = EXCLUDED.name,
-                    last_message_time = GREATEST(chats.last_message_time, EXCLUDED.last_message_time),
-                    channel = COALESCE(EXCLUDED.channel, chats.channel),
-                    is_group = COALESCE(EXCLUDED.is_group, chats.is_group)
-                """,
-                DEFAULT_TENANT,
-                chat_jid,
-                name,
-                timestamp,
-                channel,
-                is_group,
-            )
-        else:
-            await conn.execute(
-                """
-                INSERT INTO chats (tenant_id, jid, name, last_message_time, channel, is_group)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                ON CONFLICT (tenant_id, jid) DO UPDATE SET
-                    last_message_time = GREATEST(chats.last_message_time, EXCLUDED.last_message_time),
-                    channel = COALESCE(EXCLUDED.channel, chats.channel),
-                    is_group = COALESCE(EXCLUDED.is_group, chats.is_group)
-                """,
-                DEFAULT_TENANT,
-                chat_jid,
-                chat_jid,
-                timestamp,
-                channel,
-                is_group,
-            )
-
-
-async def update_chat_name(chat_jid: str, name: str) -> None:
-    """Update chat name without changing timestamp for existing chats."""
-    pool = _get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO chats (tenant_id, jid, name, last_message_time)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (tenant_id, jid) DO UPDATE SET name = EXCLUDED.name
-            """,
-            DEFAULT_TENANT,
-            chat_jid,
-            name,
-            datetime.now(UTC).isoformat(),
-        )
-
-
-async def get_all_chats() -> list[ChatInfo]:
-    """Get all known chats, ordered by most recent activity."""
-    pool = _get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT jid, name, last_message_time, channel, is_group
-            FROM chats
-            WHERE tenant_id = $1
-            ORDER BY last_message_time DESC
-            """,
-            DEFAULT_TENANT,
-        )
-    return [
-        ChatInfo(
-            jid=row["jid"],
-            name=row["name"],
-            last_message_time=row["last_message_time"],
-            channel=row["channel"],
-            is_group=bool(row["is_group"]) if row["is_group"] is not None else False,
-        )
-        for row in rows
-    ]
-
-
-async def get_last_group_sync() -> str | None:
-    """Get timestamp of last group metadata sync."""
-    pool = _get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT last_message_time FROM chats WHERE tenant_id = $1 AND jid = '__group_sync__'",
-            DEFAULT_TENANT,
-        )
-    if row is None:
-        return None
-    return row["last_message_time"] or None
-
-
-async def set_last_group_sync() -> None:
-    """Record that group metadata was synced."""
-    pool = _get_pool()
-    now = datetime.now(UTC).isoformat()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO chats (tenant_id, jid, name, last_message_time)
-            VALUES ($1, '__group_sync__', '__group_sync__', $2)
-            ON CONFLICT (tenant_id, jid) DO UPDATE SET last_message_time = EXCLUDED.last_message_time
-            """,
-            DEFAULT_TENANT,
-            now,
         )
 
 

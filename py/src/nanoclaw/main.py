@@ -56,7 +56,6 @@ from nanoclaw.db.pg import (
     create_role,
     create_tenant,
     get_all_channel_bindings,
-    get_all_chats,
     get_all_conversations,
     get_all_coworkers,
     get_all_sessions,
@@ -67,7 +66,6 @@ from nanoclaw.db.pg import (
     get_tenant_by_slug,
     init_database,
     set_session,
-    store_chat_metadata,
     update_conversation_last_invocation,
     update_tenant_message_cursor,
 )
@@ -211,17 +209,6 @@ async def _handle_incoming(
     is_group: bool,
 ) -> None:
     """Unified message handler for all channel gateways."""
-    # Store chat metadata (legacy)
-    jid_prefix = ""
-    for gw in _gateways.values():
-        if hasattr(gw, "_bots") and binding_id in getattr(gw, "_bots", {}):
-            jid_prefix = "tg:"
-        elif hasattr(gw, "_apps") and binding_id in getattr(gw, "_apps", {}):
-            jid_prefix = "slack:"
-    await store_chat_metadata(
-        f"{jid_prefix}{chat_id}", timestamp, sender_name, jid_prefix.rstrip(":") or None, is_group
-    )
-
     # Find conversation
     result = _state.find_conversation_by_binding_and_chat(binding_id, chat_id)
     if not result:
@@ -230,10 +217,9 @@ async def _handle_incoming(
     _cw_state, conv_state = result
     conv = conv_state.conversation
 
-    # Sender allowlist check
+    # Sender allowlist check (allowlist keys may use prefixed JIDs like "tg:12345")
     cfg = load_sender_allowlist()
-    full_jid = f"{jid_prefix}{chat_id}"
-    if should_drop_message(full_jid, cfg) and not is_sender_allowed(full_jid, sender, cfg):
+    if should_drop_message(chat_id, cfg) and not is_sender_allowed(chat_id, sender, cfg):
         if cfg.log_denied:
             logger.debug("sender-allowlist: dropping message (drop mode)", chat_id=chat_id, sender=sender)
         return
@@ -970,16 +956,15 @@ class _IpcDepsImpl:
         pass  # TODO: implement per-gateway sync
 
     async def get_available_groups(self) -> list[AvailableGroup]:
-        chats = await get_all_chats()
+        convs = await get_all_conversations()
         return [
             AvailableGroup(
-                jid=c.jid,
-                name=c.name,
-                last_activity=c.last_message_time,
-                is_registered=False,
+                jid=c.channel_chat_id,
+                name=c.name or c.channel_chat_id,
+                last_activity=c.created_at,
+                is_registered=True,
             )
-            for c in chats
-            if c.jid != "__group_sync__" and c.is_group
+            for c in convs
         ]
 
     def write_groups_snapshot(

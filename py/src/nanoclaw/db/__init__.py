@@ -1,7 +1,8 @@
 """Data layer — PostgreSQL persistence."""
 
+# Test helper — only import when needed
+from nanoclaw.db.pg import _init_test_database as _init_test_database
 from nanoclaw.db.pg import (
-    ChatInfo,
     close_database,
     create_channel_binding,
     create_conversation,
@@ -13,7 +14,6 @@ from nanoclaw.db.pg import (
     delete_task,
     drop_legacy_tables,
     get_all_channel_bindings,
-    get_all_chats,
     get_all_conversations,
     get_all_coworkers,
     get_all_registered_groups,
@@ -31,7 +31,6 @@ from nanoclaw.db.pg import (
     get_coworker_by_folder,
     get_coworkers_for_tenant,
     get_due_tasks,
-    get_last_group_sync,
     get_messages_since,
     get_new_messages_for_conversations,
     get_roles_for_tenant,
@@ -43,25 +42,18 @@ from nanoclaw.db.pg import (
     get_tenant_by_slug,
     init_database,
     log_task_run,
-    set_last_group_sync,
     set_registered_group,
     set_session,
     set_session_legacy,
-    store_chat_metadata,
     store_message,
     store_message_from_new_message,
-    update_chat_name,
     update_conversation_last_invocation,
     update_task,
     update_task_after_run,
     update_tenant_message_cursor,
 )
 
-# Test helper — only import when needed
-from nanoclaw.db.pg import _init_test_database as _init_test_database
-
 __all__ = [
-    "ChatInfo",
     "_init_test_database",
     "close_database",
     "create_channel_binding",
@@ -74,7 +66,6 @@ __all__ = [
     "delete_task",
     "drop_legacy_tables",
     "get_all_channel_bindings",
-    "get_all_chats",
     "get_all_conversations",
     "get_all_coworkers",
     "get_all_registered_groups",
@@ -92,7 +83,6 @@ __all__ = [
     "get_coworker_by_folder",
     "get_coworkers_for_tenant",
     "get_due_tasks",
-    "get_last_group_sync",
     "get_messages_since",
     "get_new_messages_for_conversations",
     "get_roles_for_tenant",
@@ -104,14 +94,11 @@ __all__ = [
     "get_tenant_by_slug",
     "init_database",
     "log_task_run",
-    "set_last_group_sync",
     "set_registered_group",
     "set_session",
     "set_session_legacy",
-    "store_chat_metadata",
     "store_message",
     "store_message_from_new_message",
-    "update_chat_name",
     "update_conversation_last_invocation",
     "update_task",
     "update_task_after_run",

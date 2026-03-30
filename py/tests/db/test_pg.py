@@ -33,7 +33,6 @@ from nanoclaw.db.pg import (
     get_tenant_by_slug,
     log_task_run,
     set_session,
-    store_chat_metadata,
     store_message,
     update_conversation_last_invocation,
     update_task,
@@ -359,16 +358,3 @@ async def test_log_task_run() -> None:
             status="success",
         )
     )
-
-
-# ---------------------------------------------------------------------------
-# Legacy table: chats (still used by legacy channels)
-# ---------------------------------------------------------------------------
-
-
-async def test_chat_metadata_legacy() -> None:
-    await store_chat_metadata("tg:123", "2024-01-01T00:00:00Z", name="TG Chat", channel="telegram", is_group=True)
-    from nanoclaw.db.pg import get_all_chats
-
-    chats = await get_all_chats()
-    assert any(c.jid == "tg:123" for c in chats)

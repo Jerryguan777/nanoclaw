@@ -18,7 +18,6 @@ from nanoclaw.core.config import ASSISTANT_NAME
 from nanoclaw.core.env import read_env_file
 from nanoclaw.core.logger import get_logger
 from nanoclaw.core.types import NewMessage
-from nanoclaw.db.pg import update_chat_name
 
 logger = get_logger()
 
@@ -184,7 +183,6 @@ class SlackChannel:
                 channels_list: Any = result.get("channels", [])
                 for ch in channels_list:
                     if ch.get("id") and ch.get("name") and ch.get("is_member"):
-                        await update_chat_name(f"slack:{ch['id']}", ch["name"])
                         count += 1
 
                 resp_meta: Any = result.get("response_metadata", {})
