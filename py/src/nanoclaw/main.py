@@ -123,14 +123,17 @@ async def _load_state() -> None:
     _state = OrchestratorState(global_limit=GLOBAL_MAX_CONTAINERS)
 
     # Ensure default tenant exists
-    tenant = await get_tenant_by_slug("default")
-    if tenant is None:
-        tenant = await create_tenant(name="Default Tenant", slug="default")
-        # Create default role
-        await create_role(tenant_id=tenant.id, name="general")
-        logger.info("Created default tenant and role", tenant_id=tenant.id)
+    default_tenant = await get_tenant_by_slug("default")
+    if default_tenant is None:
+        default_tenant = await create_tenant(name="Default Tenant", slug="default")
+        await create_role(tenant_id=default_tenant.id, name="general")
+        logger.info("Created default tenant and role", tenant_id=default_tenant.id)
 
-    _state.tenants[tenant.id] = tenant
+    # Load ALL tenants
+    from nanoclaw.db.pg import get_all_tenants
+
+    for t in await get_all_tenants():
+        _state.tenants[t.id] = t
 
     # Load all coworkers
     all_coworkers = await get_all_coworkers()
