@@ -484,7 +484,7 @@ async def _start_nats_ipc_subscriptions(transport: NatsTransport, deps: _IpcDeps
                                 break
 
                     if authorized:
-                        await deps.send_message_to_chat(chat_jid, data["text"])
+                        await _send_via_coworker(source_cw, chat_jid, data["text"])
                         logger.info("NATS IPC message sent", chat_jid=chat_jid, source_group=source_group)
                     else:
                         logger.warning(
@@ -882,32 +882,20 @@ class _SchedulerDepsImpl:
 
     async def send_message(self, jid: str, raw_text: str) -> None:
         text = format_outbound(raw_text)
-        if not text:
-            return
-        # Find the right gateway and binding for this jid
-        for cw in _state.coworkers.values():
-            for conv in cw.conversations.values():
-                if conv.conversation.channel_chat_id == jid:
-                    channel_type = _get_channel_type_for_chat(jid)
-                    binding = cw.channel_bindings.get(channel_type)
-                    if binding:
-                        gw = _gateways.get(channel_type)
-                        if gw:
-                            await gw.send_message(binding.id, jid, text)
-                    return
-        logger.warning("No channel for chat_id", chat_id=jid)
+        if text:
+            await _send_via_coworker(None, jid, text)
 
 
 class _IpcDepsImpl:
     """Concrete IpcDeps backed by OrchestratorState."""
 
     async def send_message(self, jid: str, text: str) -> None:
-        await _send_to_chat(jid, text)
+        await _send_via_coworker(None, jid, text)
 
     async def send_message_to_chat(self, chat_id: str, text: str) -> None:
         text = format_outbound(text)
         if text:
-            await _send_to_chat(chat_id, text)
+            await _send_via_coworker(None, chat_id, text)
 
     async def get_coworker_by_folder(self, tenant_id: str, folder: str) -> Coworker | None:
         cw = _state.get_coworker_by_folder(tenant_id, folder)
@@ -1010,8 +998,17 @@ class _IpcDepsImpl:
             t.add_done_callback(_bg_tasks.discard)
 
 
-async def _send_to_chat(chat_id: str, text: str) -> None:
-    """Send a message to a chat via the appropriate gateway."""
+async def _send_via_coworker(cw_state: CoworkerState | None, chat_id: str, text: str) -> None:
+    """Send a message using a specific coworker's binding."""
+    if cw_state:
+        channel_type = _get_channel_type_for_chat(chat_id)
+        binding = cw_state.channel_bindings.get(channel_type)
+        if binding:
+            gw = _gateways.get(channel_type)
+            if gw:
+                await gw.send_message(binding.id, chat_id, text)
+                return
+    # Fallback: scan all coworkers (for backward compat)
     for cw in _state.coworkers.values():
         for conv in cw.conversations.values():
             if conv.conversation.channel_chat_id == chat_id:
