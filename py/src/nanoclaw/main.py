@@ -424,6 +424,7 @@ async def _run_agent(
                 chat_jid=conv.channel_chat_id,
                 is_main=is_main,
                 assistant_name=config.name,
+                system_prompt=config.system_prompt,
                 tenant_id=config.tenant_id,
                 coworker_id=config.id,
                 conversation_id=conv.id,
