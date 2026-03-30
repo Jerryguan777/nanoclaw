@@ -249,6 +249,14 @@ async def _handle_incoming(
         timestamp=timestamp,
     )
 
+    # Immediately enqueue processing for this conversation
+    # (don't wait for the message loop to discover it via polling)
+    _queue.enqueue_message_check(
+        conv.id,
+        tenant_id=conv.tenant_id,
+        coworker_id=conv.coworker_id,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Message processing
