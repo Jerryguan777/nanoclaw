@@ -428,13 +428,18 @@ async def run_query(
     if extra_dirs:
         log(f"Additional directories: {', '.join(extra_dirs)}")
 
-    # Build system prompt
+    # Build system prompt from coworker config + global CLAUDE.md
     system_prompt: dict[str, Any] | None = None
+    append_parts: list[str] = []
+    if init.system_prompt:
+        append_parts.append(init.system_prompt)
     if global_claude_md:
+        append_parts.append(global_claude_md)
+    if append_parts:
         system_prompt = {
             "type": "preset",
             "preset": "claude_code",
-            "append": global_claude_md,
+            "append": "\n\n".join(append_parts),
         }
 
     # Build extra_args for resume-session-at
