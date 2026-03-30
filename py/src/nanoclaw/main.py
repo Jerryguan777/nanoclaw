@@ -109,6 +109,8 @@ _queue: GroupQueue = GroupQueue()
 _transport: NatsTransport | None = None
 _runtime: ContainerRuntime | None = None
 _executor: ContainerAgentExecutor | None = None
+# Track texts sent via IPC send_message to deduplicate against results stream
+_ipc_sent_texts: set[str] = set()
 _bg_tasks: set[asyncio.Task[None]] = set()
 
 
@@ -316,10 +318,15 @@ async def _process_conversation_messages(conversation_id: str) -> bool:
             text = re.sub(r"<internal>[\s\S]*?</internal>", "", raw).strip()
             logger.info("Agent output", coworker=config.name, chars=len(raw))
             if text and binding:
-                gw = _gateways.get(_get_channel_type_for_chat(conv.channel_chat_id))
-                if gw:
-                    await gw.send_message(binding.id, conv.channel_chat_id, text)
-                    output_sent_to_user = True
+                # Skip if this exact text was already sent via IPC send_message
+                if text in _ipc_sent_texts:
+                    _ipc_sent_texts.discard(text)
+                    logger.debug("Skipping duplicate result (already sent via IPC)", coworker=config.name)
+                else:
+                    gw = _gateways.get(_get_channel_type_for_chat(conv.channel_chat_id))
+                    if gw:
+                        await gw.send_message(binding.id, conv.channel_chat_id, text)
+                output_sent_to_user = True
             _reset_idle_timer()
         if result.status == "success":
             _queue.notify_idle(conversation_id)
@@ -475,36 +482,25 @@ async def _start_nats_ipc_subscriptions(transport: NatsTransport, deps: _IpcDeps
                                 break
                     is_main = source_cw.config.is_admin if source_cw else False
 
-                    # Skip if agent is sending to its own conversation —
-                    # the results stream (_on_output) already handles that.
-                    # IPC send_message is only for cross-chat messages.
-                    is_own_chat = False
-                    if source_cw:
+                    # Authorization: admin can send anywhere, others only to own conversations
+                    authorized = is_main
+                    if not authorized and source_cw:
                         for conv in source_cw.conversations.values():
                             if conv.conversation.channel_chat_id == chat_jid:
-                                is_own_chat = True
+                                authorized = True
                                 break
 
-                    if is_own_chat:
-                        logger.debug(
-                            "IPC send_message to own chat skipped (results stream handles it)",
+                    if authorized:
+                        # Track text sent via IPC so _on_output can deduplicate
+                        _ipc_sent_texts.add(data["text"])
+                        await _send_via_coworker(source_cw, chat_jid, data["text"])
+                        logger.info("NATS IPC message sent", chat_jid=chat_jid, source_group=source_group)
+                    else:
+                        logger.warning(
+                            "Unauthorized IPC message attempt blocked",
                             chat_jid=chat_jid,
                             source_group=source_group,
                         )
-                    else:
-                        # Cross-chat message: admin can send anywhere, others blocked
-                        authorized = is_main
-                        if authorized:
-                            await _send_via_coworker(source_cw, chat_jid, data["text"])
-                            logger.info(
-                                "NATS IPC cross-chat message sent", chat_jid=chat_jid, source_group=source_group
-                            )
-                        else:
-                            logger.warning(
-                                "Unauthorized IPC cross-chat message blocked",
-                                chat_jid=chat_jid,
-                                source_group=source_group,
-                            )
                 await msg.ack()
             except Exception:
                 logger.exception("Error processing NATS IPC message")
