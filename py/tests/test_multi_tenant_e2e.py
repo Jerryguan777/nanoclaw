@@ -797,6 +797,7 @@ class TestMigration:
         """Legacy registered_groups → coworker + binding + conversation."""
         from nanoclaw.core.types import RegisteredGroup
         from nanoclaw.db.pg import (
+            _get_pool,
             get_all_conversations,
             get_all_coworkers,
             get_all_registered_groups,
@@ -804,6 +805,33 @@ class TestMigration:
             set_registered_group,
             set_session_legacy,
         )
+
+        # Create legacy tables that no longer exist in _create_schema
+        pool = _get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS registered_groups (
+                    tenant_id TEXT NOT NULL DEFAULT 'default',
+                    jid TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    folder TEXT NOT NULL,
+                    trigger_pattern TEXT NOT NULL,
+                    added_at TEXT NOT NULL,
+                    container_config JSONB,
+                    requires_trigger BOOLEAN DEFAULT TRUE,
+                    is_main BOOLEAN DEFAULT FALSE,
+                    PRIMARY KEY (tenant_id, jid),
+                    UNIQUE (tenant_id, folder)
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS sessions_legacy (
+                    tenant_id TEXT NOT NULL DEFAULT 'default',
+                    group_folder TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    PRIMARY KEY (tenant_id, group_folder)
+                )
+            """)
 
         # Set up legacy data
         await set_registered_group(

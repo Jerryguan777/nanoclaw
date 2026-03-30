@@ -216,7 +216,7 @@ async def _create_schema(conn: asyncpg.pool.PoolConnectionProxy[asyncpg.Record])
         """)
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_task_run_logs ON task_run_logs(task_id, run_at)")
 
-    # --- Legacy tables (kept for migration, dropped after) ---
+    # --- Legacy table: chats (still used by legacy channel implementations) ---
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS chats (
             tenant_id TEXT NOT NULL DEFAULT 'default',
@@ -226,38 +226,6 @@ async def _create_schema(conn: asyncpg.pool.PoolConnectionProxy[asyncpg.Record])
             channel TEXT,
             is_group BOOLEAN DEFAULT FALSE,
             PRIMARY KEY (tenant_id, jid)
-        )
-    """)
-    await conn.execute("""
-        CREATE TABLE IF NOT EXISTS registered_groups (
-            tenant_id TEXT NOT NULL DEFAULT 'default',
-            jid TEXT NOT NULL,
-            name TEXT NOT NULL,
-            folder TEXT NOT NULL,
-            trigger_pattern TEXT NOT NULL,
-            added_at TEXT NOT NULL,
-            container_config JSONB,
-            requires_trigger BOOLEAN DEFAULT TRUE,
-            is_main BOOLEAN DEFAULT FALSE,
-            PRIMARY KEY (tenant_id, jid),
-            UNIQUE (tenant_id, folder)
-        )
-    """)
-    await conn.execute("""
-        CREATE TABLE IF NOT EXISTS router_state (
-            tenant_id TEXT NOT NULL DEFAULT 'default',
-            key TEXT NOT NULL,
-            value TEXT NOT NULL,
-            PRIMARY KEY (tenant_id, key)
-        )
-    """)
-    # Legacy sessions table (text-based, for migration)
-    await conn.execute("""
-        CREATE TABLE IF NOT EXISTS sessions_legacy (
-            tenant_id TEXT NOT NULL DEFAULT 'default',
-            group_folder TEXT NOT NULL,
-            session_id TEXT NOT NULL,
-            PRIMARY KEY (tenant_id, group_folder)
         )
     """)
 
@@ -1343,41 +1311,8 @@ async def set_last_group_sync() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Router state (legacy)
-# ---------------------------------------------------------------------------
-
-
-async def get_router_state(key: str) -> str | None:
-    """Get a value from the router_state table."""
-    pool = _get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT value FROM router_state WHERE tenant_id = $1 AND key = $2",
-            DEFAULT_TENANT,
-            key,
-        )
-    if row is None:
-        return None
-    return row["value"]  # type: ignore[no-any-return]
-
-
-async def set_router_state(key: str, value: str) -> None:
-    """Set a value in the router_state table."""
-    pool = _get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO router_state (tenant_id, key, value) VALUES ($1, $2, $3)
-            ON CONFLICT (tenant_id, key) DO UPDATE SET value = EXCLUDED.value
-            """,
-            DEFAULT_TENANT,
-            key,
-            value,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Legacy registered groups (for migration)
+# Legacy migration helpers (only used by migration script)
+# After migration these tables are dropped; functions kept for script compat.
 # ---------------------------------------------------------------------------
 
 

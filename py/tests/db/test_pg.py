@@ -6,7 +6,7 @@ import uuid
 
 import pytest
 
-from nanoclaw.core.types import RegisteredGroup, ScheduledTask, TaskRunLog
+from nanoclaw.core.types import ScheduledTask, TaskRunLog
 from nanoclaw.db.pg import (
     create_channel_binding,
     create_conversation,
@@ -16,7 +16,6 @@ from nanoclaw.db.pg import (
     create_tenant,
     create_user,
     delete_task,
-    get_all_registered_groups,
     get_all_sessions,
     get_all_tasks,
     get_all_tenants,
@@ -27,15 +26,12 @@ from nanoclaw.db.pg import (
     get_coworker_by_folder,
     get_due_tasks,
     get_messages_since,
-    get_router_state,
     get_session,
     get_task_by_id,
     get_tasks_for_coworker,
     get_tenant,
     get_tenant_by_slug,
     log_task_run,
-    set_registered_group,
-    set_router_state,
     set_session,
     store_chat_metadata,
     store_message,
@@ -366,27 +362,8 @@ async def test_log_task_run() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Legacy tables (still functional for migration)
+# Legacy table: chats (still used by legacy channels)
 # ---------------------------------------------------------------------------
-
-
-async def test_router_state_legacy() -> None:
-    await set_router_state("test_key", "test_value")
-    assert await get_router_state("test_key") == "test_value"
-    assert await get_router_state("missing") is None
-
-
-async def test_registered_groups_legacy() -> None:
-    group = RegisteredGroup(
-        name="Test Group",
-        folder="testgroup",
-        trigger="@Andy",
-        added_at="2024-01-01T00:00:00Z",
-    )
-    await set_registered_group("chat@jid", group)
-    groups = await get_all_registered_groups()
-    assert "chat@jid" in groups
-    assert groups["chat@jid"].name == "Test Group"
 
 
 async def test_chat_metadata_legacy() -> None:
