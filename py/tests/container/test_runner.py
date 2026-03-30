@@ -24,7 +24,6 @@ def _make_coworker(folder: str = "test-group", is_admin: bool = False) -> Cowork
     return Coworker(
         id="cw-1",
         tenant_id="t-1",
-        role_id="r-1",
         name="Test Coworker",
         folder=folder,
         is_admin=is_admin,

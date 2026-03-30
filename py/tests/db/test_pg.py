@@ -11,7 +11,6 @@ from nanoclaw.db.pg import (
     create_channel_binding,
     create_conversation,
     create_coworker,
-    create_role,
     create_task,
     create_tenant,
     create_user,
@@ -48,18 +47,17 @@ pytestmark = pytest.mark.usefixtures("test_db")
 # ---------------------------------------------------------------------------
 
 
-async def _create_chain() -> tuple[str, str, str, str, str]:
-    """Create tenant → role → coworker → binding → conversation. Return IDs."""
+async def _create_chain() -> tuple[str, str, str, str]:
+    """Create tenant → coworker → binding → conversation. Return IDs."""
     t = await create_tenant(name="Test Corp", slug=f"test-{uuid.uuid4().hex[:8]}")
-    r = await create_role(tenant_id=t.id, name="general")
-    cw = await create_coworker(tenant_id=t.id, role_id=r.id, name="Bot", folder=f"bot-{uuid.uuid4().hex[:8]}")
+    cw = await create_coworker(tenant_id=t.id, name="Bot", folder=f"bot-{uuid.uuid4().hex[:8]}")
     b = await create_channel_binding(
         coworker_id=cw.id, tenant_id=t.id, channel_type="telegram", credentials={"bot_token": "x"}
     )
     conv = await create_conversation(
         tenant_id=t.id, coworker_id=cw.id, channel_binding_id=b.id, channel_chat_id="12345"
     )
-    return t.id, r.id, cw.id, b.id, conv.id
+    return t.id, cw.id, b.id, conv.id
 
 
 # ---------------------------------------------------------------------------
@@ -115,14 +113,6 @@ async def test_create_user() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_create_role() -> None:
-    t = await create_tenant(name="T", slug=f"t-{uuid.uuid4().hex[:8]}")
-    r = await create_role(tenant_id=t.id, name="Ops AI", tools=["Bash", "Read"], skills=["browser"])
-    assert r.id
-    assert r.tools == ["Bash", "Read"]
-    assert r.skills == ["browser"]
-
-
 # ---------------------------------------------------------------------------
 # Coworker CRUD
 # ---------------------------------------------------------------------------
@@ -130,13 +120,20 @@ async def test_create_role() -> None:
 
 async def test_create_and_get_coworker() -> None:
     t = await create_tenant(name="T", slug=f"t-{uuid.uuid4().hex[:8]}")
-    r = await create_role(tenant_id=t.id, name="r")
     cw = await create_coworker(
-        tenant_id=t.id, role_id=r.id, name="Ops Bot", folder="ops-bot", is_admin=True, max_concurrent=3
+        tenant_id=t.id,
+        name="Ops Bot",
+        folder="ops-bot",
+        is_admin=True,
+        max_concurrent=3,
+        tools=["Bash", "Read"],
+        skills=["browser"],
     )
     assert cw.id
     assert cw.is_admin is True
     assert cw.max_concurrent == 3
+    assert cw.tools == ["Bash", "Read"]
+    assert cw.agent_backend == "claude-code"
 
     fetched = await get_coworker(cw.id)
     assert fetched is not None
@@ -154,8 +151,7 @@ async def test_create_and_get_coworker() -> None:
 
 async def test_channel_binding() -> None:
     t = await create_tenant(name="T", slug=f"t-{uuid.uuid4().hex[:8]}")
-    r = await create_role(tenant_id=t.id, name="r")
-    cw = await create_coworker(tenant_id=t.id, role_id=r.id, name="Bot", folder=f"bot-{uuid.uuid4().hex[:8]}")
+    cw = await create_coworker(tenant_id=t.id, name="Bot", folder=f"bot-{uuid.uuid4().hex[:8]}")
     b = await create_channel_binding(
         coworker_id=cw.id, tenant_id=t.id, channel_type="telegram", credentials={"bot_token": "abc"}
     )
@@ -173,7 +169,7 @@ async def test_channel_binding() -> None:
 
 
 async def test_conversation_crud() -> None:
-    _tid, _, _cwid, bid, convid = await _create_chain()
+    _tid, _cwid, bid, convid = await _create_chain()
     conv = await get_conversation(convid)
     assert conv is not None
     assert conv.channel_chat_id == "12345"
@@ -195,7 +191,7 @@ async def test_conversation_crud() -> None:
 
 
 async def test_sessions_per_conversation() -> None:
-    tid, _, cwid, _, convid = await _create_chain()
+    tid, cwid, _, convid = await _create_chain()
     assert await get_session(convid) is None
     await set_session(convid, tid, cwid, "sess-abc")
     assert await get_session(convid) == "sess-abc"
@@ -210,7 +206,7 @@ async def test_sessions_per_conversation() -> None:
 
 
 async def test_store_and_get_messages() -> None:
-    tid, _, _, _, convid = await _create_chain()
+    tid, _, _, convid = await _create_chain()
     await store_message(
         tenant_id=tid,
         conversation_id=convid,
@@ -226,7 +222,7 @@ async def test_store_and_get_messages() -> None:
 
 
 async def test_get_messages_since_filter() -> None:
-    tid, _, _, _, convid = await _create_chain()
+    tid, _, _, convid = await _create_chain()
     await store_message(
         tenant_id=tid,
         conversation_id=convid,
@@ -256,7 +252,7 @@ async def test_get_messages_since_filter() -> None:
 
 
 async def test_task_crud() -> None:
-    tid, _, cwid, _, _ = await _create_chain()
+    tid, cwid, _, _ = await _create_chain()
     task_id = str(uuid.uuid4())
     await create_task(
         ScheduledTask(
@@ -292,7 +288,7 @@ async def test_task_crud() -> None:
 
 
 async def test_get_due_tasks() -> None:
-    tid, _, cwid, _, _ = await _create_chain()
+    tid, cwid, _, _ = await _create_chain()
     task_id = str(uuid.uuid4())
     await create_task(
         ScheduledTask(
@@ -312,7 +308,7 @@ async def test_get_due_tasks() -> None:
 
 
 async def test_update_task_after_run() -> None:
-    tid, _, cwid, _, _ = await _create_chain()
+    tid, cwid, _, _ = await _create_chain()
     task_id = str(uuid.uuid4())
     await create_task(
         ScheduledTask(
@@ -334,7 +330,7 @@ async def test_update_task_after_run() -> None:
 
 
 async def test_log_task_run() -> None:
-    tid, _, cwid, _, _ = await _create_chain()
+    tid, cwid, _, _ = await _create_chain()
     task_id = str(uuid.uuid4())
     await create_task(
         ScheduledTask(

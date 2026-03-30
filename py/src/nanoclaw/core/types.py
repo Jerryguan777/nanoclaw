@@ -82,28 +82,17 @@ class User:
 
 
 @dataclass
-class Role:
-    """An AI agent template within a tenant."""
+class Coworker:
+    """An AI coworker with own workspace, identity, and agent config."""
 
     id: str  # UUID
     tenant_id: str
     name: str
+    folder: str
     agent_backend: str = "claude-code"
     system_prompt: str | None = None
     tools: list[str] = field(default_factory=list)
     skills: list[str] = field(default_factory=list)
-    created_at: str = ""
-
-
-@dataclass
-class Coworker:
-    """A role instance with own workspace and identity."""
-
-    id: str  # UUID
-    tenant_id: str
-    role_id: str
-    name: str
-    folder: str
     is_admin: bool = False
     container_config: ContainerConfig | None = None
     max_concurrent: int = 2
@@ -165,14 +154,12 @@ class RegisteredGroup:
 def registered_group_to_coworker(
     group: RegisteredGroup,
     tenant_id: str,
-    role_id: str,
     coworker_id: str,
 ) -> Coworker:
     """Convert a legacy RegisteredGroup to a Coworker."""
     return Coworker(
         id=coworker_id,
         tenant_id=tenant_id,
-        role_id=role_id,
         name=group.name,
         folder=group.folder,
         is_admin=group.is_main,

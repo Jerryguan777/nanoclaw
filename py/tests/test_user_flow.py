@@ -74,17 +74,14 @@ class TestScenarioFirstTimeUser:
             create_channel_binding,
             create_conversation,
             create_coworker,
-            create_role,
             create_tenant,
             get_session,
             set_session,
         )
 
         t = await create_tenant(name="Acme Corp", slug="acme")
-        r = await create_role(tenant_id=t.id, name="Operations AI")
         cw = await create_coworker(
             tenant_id=t.id,
-            role_id=r.id,
             name="Ops Bot",
             folder="ops-bot",
             is_admin=True,
@@ -165,15 +162,13 @@ class TestScenarioIPCFromContainer:
         """Agent creates a task via IPC handler."""
         from nanoclaw.db.pg import (
             create_coworker,
-            create_role,
             create_tenant,
             get_task_by_id,
         )
         from nanoclaw.ipc.task_handler import process_task_ipc
 
         t = await create_tenant(name="T", slug="t-ipc")
-        r = await create_role(tenant_id=t.id, name="r")
-        cw = await create_coworker(tenant_id=t.id, role_id=r.id, name="Bot", folder="bot")
+        cw = await create_coworker(tenant_id=t.id, name="Bot", folder="bot")
 
         tasks_changed: list[bool] = []
 
@@ -397,15 +392,13 @@ class TestScenarioDatabaseOperations:
             create_channel_binding,
             create_conversation,
             create_coworker,
-            create_role,
             create_tenant,
             get_messages_since,
             store_message,
         )
 
         t = await create_tenant(name="T", slug="t-db")
-        r = await create_role(tenant_id=t.id, name="r")
-        cw = await create_coworker(tenant_id=t.id, role_id=r.id, name="Bot", folder="bot-db")
+        cw = await create_coworker(tenant_id=t.id, name="Bot", folder="bot-db")
         b = await create_channel_binding(coworker_id=cw.id, tenant_id=t.id, channel_type="tg")
         conv = await create_conversation(
             tenant_id=t.id,
@@ -438,7 +431,6 @@ class TestScenarioDatabaseOperations:
         from nanoclaw.core.types import ScheduledTask
         from nanoclaw.db.pg import (
             create_coworker,
-            create_role,
             create_task,
             create_tenant,
             delete_task,
@@ -447,8 +439,7 @@ class TestScenarioDatabaseOperations:
         )
 
         t = await create_tenant(name="T", slug="t-task")
-        r = await create_role(tenant_id=t.id, name="r")
-        cw = await create_coworker(tenant_id=t.id, role_id=r.id, name="Bot", folder="bot-task")
+        cw = await create_coworker(tenant_id=t.id, name="Bot", folder="bot-task")
 
         task_id = str(uuid.uuid4())
         await create_task(

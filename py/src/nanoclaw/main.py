@@ -53,7 +53,6 @@ from nanoclaw.db.pg import (
     DEFAULT_TENANT,
     close_database,
     create_conversation,
-    create_role,
     create_tenant,
     get_all_channel_bindings,
     get_all_conversations,
@@ -62,7 +61,6 @@ from nanoclaw.db.pg import (
     get_all_tasks,
     get_messages_since,
     get_new_messages_for_conversations,
-    get_roles_for_tenant,
     get_tenant_by_slug,
     init_database,
     set_session,
@@ -128,8 +126,7 @@ async def _load_state() -> None:
     default_tenant = await get_tenant_by_slug("default")
     if default_tenant is None:
         default_tenant = await create_tenant(name="Default Tenant", slug="default")
-        await create_role(tenant_id=default_tenant.id, name="general")
-        logger.info("Created default tenant and role", tenant_id=default_tenant.id)
+        logger.info("Created default tenant", tenant_id=default_tenant.id)
 
     # Load ALL tenants
     from nanoclaw.db.pg import get_all_tenants
@@ -143,12 +140,6 @@ async def _load_state() -> None:
     all_conversations = await get_all_conversations()
     all_sessions = await get_all_sessions()
 
-    # Load roles for building CoworkerConfig
-    roles_by_id: dict[str, object] = {}
-    for t in _state.tenants.values():
-        for r in await get_roles_for_tenant(t.id):
-            roles_by_id[r.id] = r
-
     # Index bindings and conversations
     bindings_by_coworker: dict[str, list[ChannelBinding]] = {}
     for b in all_bindings:
@@ -159,19 +150,18 @@ async def _load_state() -> None:
         convs_by_coworker.setdefault(c.coworker_id, []).append(c)
 
     for cw in all_coworkers:
-        role = roles_by_id.get(cw.role_id)
         config = CoworkerConfig(
             id=cw.id,
             tenant_id=cw.tenant_id,
             name=cw.name,
             folder=cw.folder,
-            system_prompt=getattr(role, "system_prompt", None) if role else None,
+            system_prompt=cw.system_prompt,
             trigger_pattern=CoworkerConfig.build_trigger_pattern(cw.name),
-            agent_backend=getattr(role, "agent_backend", "claude-code") if role else "claude-code",
+            agent_backend=cw.agent_backend,
             container_image=None,
             max_concurrent=cw.max_concurrent,
-            tools=getattr(role, "tools", []) if role else [],
-            skills=getattr(role, "skills", []) if role else [],
+            tools=cw.tools,
+            skills=cw.skills,
             is_admin=cw.is_admin,
         )
 
@@ -784,7 +774,6 @@ async def main() -> None:
         return Coworker(
             id=cw.config.id,
             tenant_id=cw.config.tenant_id,
-            role_id="",
             name=cw.config.name,
             folder=cw.config.folder,
             is_admin=cw.config.is_admin,
@@ -871,7 +860,6 @@ class _SchedulerDepsImpl:
         return Coworker(
             id=cw.config.id,
             tenant_id=cw.config.tenant_id,
-            role_id="",
             name=cw.config.name,
             folder=cw.config.folder,
             is_admin=cw.config.is_admin,
@@ -931,7 +919,6 @@ class _IpcDepsImpl:
         return Coworker(
             id=cw.config.id,
             tenant_id=cw.config.tenant_id,
-            role_id="",
             name=cw.config.name,
             folder=cw.config.folder,
             is_admin=cw.config.is_admin,

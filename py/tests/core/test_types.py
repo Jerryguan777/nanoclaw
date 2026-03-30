@@ -8,7 +8,6 @@ from nanoclaw.core.types import (
     Coworker,
     NewMessage,
     RegisteredGroup,
-    Role,
     ScheduledTask,
     TaskRunLog,
     Tenant,
@@ -84,15 +83,11 @@ def test_tenant_defaults() -> None:
     assert t.last_message_cursor is None
 
 
-def test_role_defaults() -> None:
-    r = Role(id="r1", tenant_id="t1", name="general")
-    assert r.agent_backend == "claude-code"
-    assert r.tools == []
-    assert r.skills == []
-
-
 def test_coworker_defaults() -> None:
-    cw = Coworker(id="cw1", tenant_id="t1", role_id="r1", name="Bot", folder="bot")
+    cw = Coworker(id="cw1", tenant_id="t1", name="Bot", folder="bot")
+    assert cw.agent_backend == "claude-code"
+    assert cw.tools == []
+    assert cw.skills == []
     assert cw.is_admin is False
     assert cw.max_concurrent == 2
     assert cw.status == "active"
@@ -124,7 +119,7 @@ def test_user_defaults() -> None:
 
 def test_registered_group_to_coworker() -> None:
     group = RegisteredGroup(name="test", folder="test", trigger="@Andy", added_at="2024-01-01", is_main=True)
-    cw = registered_group_to_coworker(group, "t1", "r1", "cw1")
+    cw = registered_group_to_coworker(group, "t1", "cw1")
     assert cw.name == "test"
     assert cw.folder == "test"
     assert cw.is_admin is True

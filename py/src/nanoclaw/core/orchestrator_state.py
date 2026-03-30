@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class CoworkerConfig:
-    """Runtime config, merged from Role + Coworker tables."""
+    """Runtime config loaded from coworkers table."""
 
     id: str
     tenant_id: str

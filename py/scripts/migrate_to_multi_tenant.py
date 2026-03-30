@@ -23,7 +23,6 @@ from nanoclaw.db.pg import (
     create_channel_binding,
     create_conversation,
     create_coworker,
-    create_role,
     create_tenant,
     drop_legacy_tables,
     get_all_registered_groups,
@@ -143,9 +142,6 @@ async def migrate_to_multi_tenant() -> None:
     else:
         logger.info("Using existing default tenant", tenant_id=tenant.id)
 
-    role = await create_role(tenant_id=tenant.id, name="general")
-    logger.info("Created default role", role_id=role.id)
-
     # ---- Phase 3: Drop legacy tables → new-format tables created ----
 
     await drop_legacy_tables()
@@ -156,10 +152,8 @@ async def migrate_to_multi_tenant() -> None:
         logger.info("Migrating group", jid=p.jid, name=p.name, folder=p.folder, channel_type=p.channel_type)
 
         # In single-tenant migration, all coworkers share the global ASSISTANT_NAME.
-        # The group name is used as the conversation display name instead.
         coworker = await create_coworker(
             tenant_id=tenant.id,
-            role_id=role.id,
             name=ASSISTANT_NAME,
             folder=p.folder,
             is_admin=p.is_main,

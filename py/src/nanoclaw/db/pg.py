@@ -18,7 +18,6 @@ from nanoclaw.core.types import (
     Coworker,
     NewMessage,
     RegisteredGroup,
-    Role,
     ScheduledTask,
     TaskRunLog,
     Tenant,
@@ -82,25 +81,15 @@ async def _create_schema(conn: asyncpg.pool.PoolConnectionProxy[asyncpg.Record])
         )
     """)
     await conn.execute("""
-        CREATE TABLE IF NOT EXISTS roles (
+        CREATE TABLE IF NOT EXISTS coworkers (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             tenant_id UUID NOT NULL REFERENCES tenants(id),
             name TEXT NOT NULL,
+            folder TEXT NOT NULL,
             agent_backend TEXT DEFAULT 'claude-code',
             system_prompt TEXT,
             tools JSONB DEFAULT '[]',
             skills JSONB DEFAULT '[]',
-            created_at TIMESTAMPTZ DEFAULT now(),
-            UNIQUE (tenant_id, name)
-        )
-    """)
-    await conn.execute("""
-        CREATE TABLE IF NOT EXISTS coworkers (
-            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            tenant_id UUID NOT NULL REFERENCES tenants(id),
-            role_id UUID NOT NULL REFERENCES roles(id),
-            name TEXT NOT NULL,
-            folder TEXT NOT NULL,
             is_admin BOOLEAN DEFAULT FALSE,
             container_config JSONB,
             max_concurrent INT DEFAULT 2,
@@ -109,6 +98,35 @@ async def _create_schema(conn: asyncpg.pool.PoolConnectionProxy[asyncpg.Record])
             UNIQUE (tenant_id, folder)
         )
     """)
+
+    # Migrate from roles table if it exists (Step 5 -> merged schema)
+    has_roles = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name='roles')")
+    if has_roles:
+        has_role_id = await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM information_schema.columns "
+            "WHERE table_name='coworkers' AND column_name='role_id')"
+        )
+        if has_role_id:
+            for col, default in [
+                ("agent_backend", "'claude-code'"),
+                ("system_prompt", "NULL"),
+                ("tools", "'[]'::jsonb"),
+                ("skills", "'[]'::jsonb"),
+            ]:
+                await conn.execute(
+                    f"ALTER TABLE coworkers ADD COLUMN IF NOT EXISTS {col} "
+                    f"{'JSONB' if col in ('tools', 'skills') else 'TEXT'} DEFAULT {default}"
+                )
+            await conn.execute("""
+                UPDATE coworkers SET
+                    agent_backend = r.agent_backend,
+                    system_prompt = r.system_prompt,
+                    tools = r.tools,
+                    skills = r.skills
+                FROM roles r WHERE coworkers.role_id = r.id
+            """)
+            await conn.execute("ALTER TABLE coworkers DROP COLUMN role_id")
+        await conn.execute("DROP TABLE IF EXISTS roles CASCADE")
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS channel_bindings (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -372,65 +390,6 @@ def _record_to_user(row: asyncpg.Record) -> User:
 
 
 # ---------------------------------------------------------------------------
-# Role CRUD
-# ---------------------------------------------------------------------------
-
-
-async def create_role(
-    tenant_id: str,
-    name: str,
-    agent_backend: str = "claude-code",
-    system_prompt: str | None = None,
-    tools: list[str] | None = None,
-    skills: list[str] | None = None,
-) -> Role:
-    """Create a new role."""
-    pool = _get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            INSERT INTO roles (tenant_id, name, agent_backend, system_prompt, tools, skills)
-            VALUES ($1::uuid, $2, $3, $4, $5::jsonb, $6::jsonb)
-            RETURNING id, tenant_id, name, agent_backend, system_prompt, tools, skills, created_at
-            """,
-            tenant_id,
-            name,
-            agent_backend,
-            system_prompt,
-            json.dumps(tools or []),
-            json.dumps(skills or []),
-        )
-    assert row is not None
-    return _record_to_role(row)
-
-
-def _record_to_role(row: asyncpg.Record) -> Role:
-    tools_raw = row["tools"]
-    skills_raw = row["skills"]
-    return Role(
-        id=str(row["id"]),
-        tenant_id=str(row["tenant_id"]),
-        name=row["name"],
-        agent_backend=row["agent_backend"] or "claude-code",
-        system_prompt=row["system_prompt"],
-        tools=tools_raw if isinstance(tools_raw, list) else json.loads(tools_raw) if tools_raw else [],
-        skills=skills_raw if isinstance(skills_raw, list) else json.loads(skills_raw) if skills_raw else [],
-        created_at=row["created_at"].isoformat() if row["created_at"] else "",
-    )
-
-
-async def get_roles_for_tenant(tenant_id: str) -> list[Role]:
-    """Get all roles for a tenant."""
-    pool = _get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT * FROM roles WHERE tenant_id = $1::uuid ORDER BY name",
-            tenant_id,
-        )
-    return [_record_to_role(row) for row in rows]
-
-
-# ---------------------------------------------------------------------------
 # Coworker CRUD
 # ---------------------------------------------------------------------------
 
@@ -460,9 +419,12 @@ def _parse_container_config(raw: dict[str, Any] | str | None) -> ContainerConfig
 
 async def create_coworker(
     tenant_id: str,
-    role_id: str,
     name: str,
     folder: str,
+    agent_backend: str = "claude-code",
+    system_prompt: str | None = None,
+    tools: list[str] | None = None,
+    skills: list[str] | None = None,
     is_admin: bool = False,
     container_config: ContainerConfig | None = None,
     max_concurrent: int = 2,
@@ -483,14 +445,17 @@ async def create_coworker(
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            INSERT INTO coworkers (tenant_id, role_id, name, folder, is_admin, container_config, max_concurrent)
-            VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6::jsonb, $7)
-            RETURNING id, tenant_id, role_id, name, folder, is_admin, container_config, max_concurrent, status, created_at
+            INSERT INTO coworkers (tenant_id, name, folder, agent_backend, system_prompt, tools, skills, is_admin, container_config, max_concurrent)
+            VALUES ($1::uuid, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9::jsonb, $10)
+            RETURNING *
             """,
             tenant_id,
-            role_id,
             name,
             folder,
+            agent_backend,
+            system_prompt,
+            json.dumps(tools or []),
+            json.dumps(skills or []),
             is_admin,
             cc_json,
             max_concurrent,
@@ -500,12 +465,17 @@ async def create_coworker(
 
 
 def _record_to_coworker(row: asyncpg.Record) -> Coworker:
+    tools_raw = row.get("tools")
+    skills_raw = row.get("skills")
     return Coworker(
         id=str(row["id"]),
         tenant_id=str(row["tenant_id"]),
-        role_id=str(row["role_id"]),
         name=row["name"],
         folder=row["folder"],
+        agent_backend=row.get("agent_backend") or "claude-code",
+        system_prompt=row.get("system_prompt"),
+        tools=tools_raw if isinstance(tools_raw, list) else json.loads(tools_raw) if tools_raw else [],
+        skills=skills_raw if isinstance(skills_raw, list) else json.loads(skills_raw) if skills_raw else [],
         is_admin=bool(row["is_admin"]),
         container_config=_parse_container_config(row["container_config"]),
         max_concurrent=row["max_concurrent"],

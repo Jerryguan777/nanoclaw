@@ -2456,3 +2456,197 @@ $(gh issue view 12 --json title,body --jq '"# " + .title + "\n\n" + .body')
 ```
 
 > 替换为实际 Issue 编号。
+
+---
+
+## Step 5.1：合并 Role 到 Coworker（去除过度设计）
+
+**目标**：删除 `roles` 表，将其字段合并到 `coworkers` 表。Role 的"模板复用"能力当前没有代码使用，属于过度设计。
+
+**前置条件**：Step 5 完成。在 `step5/multi-tenant` 分支上直接做。
+
+**改动范围**：~200 行改动，涉及 6 个文件。
+
+### 创建 Issue 命令
+
+```bash
+gh issue create \
+  --title "refactor: merge roles table into coworkers (remove over-engineering)" \
+  --label "refactor,python-rewrite" \
+  --body "$(cat <<'ISSUE_EOF'
+## Context
+
+Step 5 introduced a \`roles\` table as an AI agent template layer: Role defines (system_prompt, tools, skills, agent_backend), Coworker inherits from Role and optionally overrides. This was designed for a scenario where 5 operations AI coworkers share the same prompt configuration.
+
+In practice, **no code uses the template-reuse capability**:
+- There is no UI to "create coworker from role"
+- \`CoworkerConfig\` merges Role + Coworker at load time, then Role is never accessed again
+- Migration creates a single \`"general"\` role that all coworkers point to — no differentiation
+- Every coworker creation requires a role to exist first, adding unnecessary ceremony
+
+The indirection adds complexity (extra table, extra JOIN, extra CRUD functions, \`role_id\` FK) with zero current benefit. If template reuse is needed later, adding the Role table back is a one-day task.
+
+**This refactoring runs on the \`step5/multi-tenant\` branch directly.**
+
+## Changes
+
+### 1. Database Schema
+
+**Drop \`roles\` table. Add its columns to \`coworkers\`:**
+
+\`\`\`sql
+-- After (one table, no roles):
+CREATE TABLE coworkers (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id),
+    name TEXT NOT NULL,                           -- coworker display name (trigger derived from this)
+    folder TEXT NOT NULL,
+    agent_backend TEXT DEFAULT 'claude-code',      -- moved from roles
+    system_prompt TEXT,                            -- moved from roles
+    tools JSONB DEFAULT '[]',                      -- moved from roles
+    skills JSONB DEFAULT '[]',                     -- moved from roles
+    is_admin BOOLEAN DEFAULT FALSE,
+    container_config JSONB,
+    max_concurrent INT DEFAULT 2,
+    status TEXT DEFAULT 'active',
+    created_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE (tenant_id, folder)
+);
+\`\`\`
+
+**Migration** (for existing Step 5 databases):
+\`\`\`sql
+-- Merge role fields into coworkers
+ALTER TABLE coworkers ADD COLUMN IF NOT EXISTS agent_backend TEXT DEFAULT 'claude-code';
+ALTER TABLE coworkers ADD COLUMN IF NOT EXISTS system_prompt TEXT;
+ALTER TABLE coworkers ADD COLUMN IF NOT EXISTS tools JSONB DEFAULT '[]';
+ALTER TABLE coworkers ADD COLUMN IF NOT EXISTS skills JSONB DEFAULT '[]';
+
+UPDATE coworkers SET
+    agent_backend = r.agent_backend,
+    system_prompt = r.system_prompt,
+    tools = r.tools,
+    skills = r.skills
+FROM roles r WHERE coworkers.role_id = r.id;
+
+ALTER TABLE coworkers DROP COLUMN IF EXISTS role_id;
+DROP TABLE IF EXISTS roles;
+\`\`\`
+
+### 2. \`src/nanoclaw/core/types.py\`
+
+**Delete** \`Role\` dataclass entirely.
+
+**Update** \`Coworker\` dataclass — add fields from Role, remove \`role_id\`:
+
+\`\`\`python
+@dataclass
+class Coworker:
+    id: str
+    tenant_id: str
+    name: str
+    folder: str
+    agent_backend: str = "claude-code"
+    system_prompt: str | None = None
+    tools: list[str] = field(default_factory=list)
+    skills: list[str] = field(default_factory=list)
+    is_admin: bool = False
+    container_config: ContainerConfig | None = None
+    max_concurrent: int = 2
+    status: str = "active"
+    created_at: str = ""
+\`\`\`
+
+**Update** \`registered_group_to_coworker()\` — remove \`role_id\` parameter.
+
+### 3. \`src/nanoclaw/core/orchestrator_state.py\`
+
+**Update** \`CoworkerConfig\` docstring from "merged from Role + Coworker" to "loaded from coworkers table".
+
+No field changes — CoworkerConfig already has all the right fields.
+
+### 4. \`src/nanoclaw/main.py\`
+
+**Remove**:
+- Imports: \`create_role\`, \`get_roles_for_tenant\`
+- Role loading loop in \`_load_multi_tenant_state()\`
+- \`roles_by_id\` dict
+- Role-Coworker merge logic when building \`CoworkerConfig\`
+- \`create_role()\` call in migration
+
+**Simplify** CoworkerConfig building — read directly from Coworker fields:
+\`\`\`python
+config = CoworkerConfig(
+    id=cw.id,
+    tenant_id=cw.tenant_id,
+    name=cw.name,
+    folder=cw.folder,
+    system_prompt=cw.system_prompt,
+    agent_backend=cw.agent_backend,
+    tools=cw.tools,
+    skills=cw.skills,
+    trigger_pattern=CoworkerConfig.build_trigger_pattern(cw.name),
+    container_image=None,
+    max_concurrent=cw.max_concurrent,
+    is_admin=cw.is_admin,
+)
+\`\`\`
+
+**Update** coworker creation — remove \`role_id\`, add config fields directly.
+
+### 5. \`src/nanoclaw/db/pg.py\`
+
+- **Delete** \`roles\` table DDL from \`_create_schema()\`
+- **Delete** \`create_role()\` and \`get_roles_for_tenant()\` functions
+- **Update** \`coworkers\` DDL — add \`agent_backend\`, \`system_prompt\`, \`tools\`, \`skills\`; remove \`role_id\` FK
+- **Update** \`create_coworker()\` signature — remove \`role_id\`, add new fields
+- **Update** \`_row_to_coworker()\` — read new columns, remove \`role_id\`
+- **Add** migration detection: if \`roles\` table exists, run ALTER + merge + DROP
+
+### 6. \`src/nanoclaw/db/__init__.py\`
+
+Remove re-exports: \`create_role\`, \`get_roles_for_tenant\`, \`Role\`.
+
+### 7. Tests
+
+Update tests that create roles before coworkers — pass config fields directly to \`create_coworker()\`.
+
+## Acceptance Criteria
+
+- [ ] \`roles\` table dropped from schema
+- [ ] \`Role\` dataclass deleted from \`core/types.py\`
+- [ ] \`create_role()\` and \`get_roles_for_tenant()\` deleted from \`db/pg.py\`
+- [ ] \`Coworker\` dataclass has \`agent_backend\`, \`system_prompt\`, \`tools\`, \`skills\` fields
+- [ ] \`Coworker\` dataclass has no \`role_id\` field
+- [ ] \`coworkers\` table has new columns, no \`role_id\`
+- [ ] \`main.py\` builds \`CoworkerConfig\` directly from \`Coworker\` (no role merging)
+- [ ] Migration handles both fresh install and existing Step 5 database
+- [ ] All tests pass
+- [ ] \`ruff check . && mypy --strict src/nanoclaw && pytest\` pass
+- [ ] No references to \`Role\`, \`role_id\`, \`create_role\`, or \`get_roles_for_tenant\` in production code
+
+## Important Notes
+
+- **Branch**: Work directly on \`step5/multi-tenant\` (not a new branch)
+- **This is a simplification** — behavior is identical, fewer tables and concepts
+- **If template reuse is needed later**, adding \`roles\` table back is straightforward
+- **Migration must handle two cases**: (a) fresh install — merged schema; (b) existing Step 5 DB — ALTER TABLE migration
+ISSUE_EOF
+)"
+```
+
+### 启动 Claude Code 执行
+
+Issue 创建后，记下 Issue 编号，新开 Claude Code 会话，粘贴以下内容：
+
+```
+请读取 GitHub Issue 并按要求完成任务：
+
+$(gh issue view 14 --json title,body --jq '"# " + .title + "\n\n" + .body')
+
+工作目录：py/
+分支：直接在 step5/multi-tenant 上工作（不创建新分支）
+完成后提交代码。
+```
+
+> 替换为实际 Issue 编号。

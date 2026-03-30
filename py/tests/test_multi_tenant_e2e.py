@@ -28,7 +28,6 @@ from nanoclaw.core.types import (
     ChannelBinding,
     Conversation,
     Coworker,
-    Role,
     Tenant,
 )
 
@@ -82,15 +81,8 @@ async def _create_tenant_in_db(name: str, slug: str, max_containers: int = 5) ->
     return await create_tenant(name=name, slug=slug, max_concurrent_containers=max_containers)
 
 
-async def _create_role_in_db(tenant_id: str, name: str = "general") -> Role:
-    from nanoclaw.db.pg import create_role
-
-    return await create_role(tenant_id=tenant_id, name=name)
-
-
 async def _create_coworker_full(
     tenant_id: str,
-    role_id: str,
     name: str,
     folder: str,
     is_admin: bool = False,
@@ -105,7 +97,6 @@ async def _create_coworker_full(
 
     cw = await create_coworker(
         tenant_id=tenant_id,
-        role_id=role_id,
         name=name,
         folder=folder,
         is_admin=is_admin,
@@ -134,7 +125,6 @@ async def _create_coworker_full(
 
 def _build_coworker_state(
     cw: Coworker,
-    role: Role,
     binding: ChannelBinding,
     conversations: list[Conversation],
 ) -> CoworkerState:
@@ -144,9 +134,9 @@ def _build_coworker_state(
         tenant_id=cw.tenant_id,
         name=cw.name,
         folder=cw.folder,
-        system_prompt=role.system_prompt,
+        system_prompt=cw.system_prompt,
         trigger_pattern=CoworkerConfig.build_trigger_pattern(cw.name),
-        agent_backend=role.agent_backend,
+        agent_backend=cw.agent_backend,
         container_image=None,
         max_concurrent=cw.max_concurrent,
         is_admin=cw.is_admin,
@@ -349,18 +339,15 @@ class TestTwoCoworkersSameGroup:
     async def test_ops_bot_only_responds_to_ops_mention(self, env: Path) -> None:
         """@Ops Bot triggers ops coworker; @CS Bot in same group does not."""
         tenant = await _create_tenant_in_db("Acme", "acme-2cw")
-        role = await _create_role_in_db(tenant.id)
 
         ops_cw, ops_bind, ops_convs = await _create_coworker_full(
             tenant.id,
-            role.id,
             "Ops Bot",
             "ops-bot",
             chat_ids=["-1001000"],
         )
         cs_cw, cs_bind, cs_convs = await _create_coworker_full(
             tenant.id,
-            role.id,
             "CS Bot",
             "cs-bot",
             chat_ids=["-1001000"],  # Same group!
@@ -368,8 +355,8 @@ class TestTwoCoworkersSameGroup:
 
         state = OrchestratorState(global_limit=10)
         state.tenants[tenant.id] = tenant
-        state.coworkers[ops_cw.id] = _build_coworker_state(ops_cw, role, ops_bind, ops_convs)
-        state.coworkers[cs_cw.id] = _build_coworker_state(cs_cw, role, cs_bind, cs_convs)
+        state.coworkers[ops_cw.id] = _build_coworker_state(ops_cw, ops_bind, ops_convs)
+        state.coworkers[cs_cw.id] = _build_coworker_state(cs_cw, cs_bind, cs_convs)
 
         executor = MockExecutor(response="Shipment tracking updated.")
         gateway = MockGateway()
@@ -395,11 +382,9 @@ class TestTwoCoworkersSameGroup:
     async def test_message_without_any_trigger_ignored_by_both(self, env: Path) -> None:
         """A message without @mention triggers neither bot."""
         tenant = await _create_tenant_in_db("Acme", "acme-notrig")
-        role = await _create_role_in_db(tenant.id)
 
         ops_cw, ops_bind, ops_convs = await _create_coworker_full(
             tenant.id,
-            role.id,
             "Ops Bot",
             "ops-notrig",
             chat_ids=["-1002000"],
@@ -407,7 +392,7 @@ class TestTwoCoworkersSameGroup:
 
         state = OrchestratorState(global_limit=10)
         state.tenants[tenant.id] = tenant
-        state.coworkers[ops_cw.id] = _build_coworker_state(ops_cw, role, ops_bind, ops_convs)
+        state.coworkers[ops_cw.id] = _build_coworker_state(ops_cw, ops_bind, ops_convs)
 
         executor = MockExecutor()
         _wire_main_state(state, executor, {"telegram": MockGateway()})
@@ -423,11 +408,9 @@ class TestTwoCoworkersSameGroup:
     async def test_admin_coworker_skips_trigger_check(self, env: Path) -> None:
         """Admin coworker (is_main) responds to any message, no trigger needed."""
         tenant = await _create_tenant_in_db("Acme", "acme-admin")
-        role = await _create_role_in_db(tenant.id)
 
         admin_cw, admin_bind, admin_convs = await _create_coworker_full(
             tenant.id,
-            role.id,
             "Admin Bot",
             "admin-bot",
             is_admin=True,
@@ -437,7 +420,7 @@ class TestTwoCoworkersSameGroup:
 
         state = OrchestratorState(global_limit=10)
         state.tenants[tenant.id] = tenant
-        state.coworkers[admin_cw.id] = _build_coworker_state(admin_cw, role, admin_bind, admin_convs)
+        state.coworkers[admin_cw.id] = _build_coworker_state(admin_cw, admin_bind, admin_convs)
 
         executor = MockExecutor(response="I'm the admin bot!")
         gateway = MockGateway()
@@ -466,11 +449,9 @@ class TestSessionIsolation:
     async def test_different_conversations_get_different_sessions(self, env: Path) -> None:
         """Same coworker, two groups → independent session IDs."""
         tenant = await _create_tenant_in_db("Acme", "acme-sess")
-        role = await _create_role_in_db(tenant.id)
 
         cw, binding, convs = await _create_coworker_full(
             tenant.id,
-            role.id,
             "Ops Bot",
             "ops-sess",
             is_admin=True,
@@ -480,7 +461,7 @@ class TestSessionIsolation:
 
         state = OrchestratorState(global_limit=10)
         state.tenants[tenant.id] = tenant
-        state.coworkers[cw.id] = _build_coworker_state(cw, role, binding, convs)
+        state.coworkers[cw.id] = _build_coworker_state(cw, binding, convs)
 
         # Executor returns different session IDs for each call
         call_count = 0
@@ -523,11 +504,9 @@ class TestSessionIsolation:
     async def test_cursor_rollback_is_per_conversation(self, env: Path) -> None:
         """Agent fails in Group A → only Group A's cursor rolls back, not Group B's."""
         tenant = await _create_tenant_in_db("Acme", "acme-rollback")
-        role = await _create_role_in_db(tenant.id)
 
         cw, binding, convs = await _create_coworker_full(
             tenant.id,
-            role.id,
             "Ops Bot",
             "ops-rb",
             is_admin=True,
@@ -537,7 +516,7 @@ class TestSessionIsolation:
 
         state = OrchestratorState(global_limit=10)
         state.tenants[tenant.id] = tenant
-        state.coworkers[cw.id] = _build_coworker_state(cw, role, binding, convs)
+        state.coworkers[cw.id] = _build_coworker_state(cw, binding, convs)
 
         # First: succeed in Group B
         executor = MockExecutor(response="Success")
@@ -675,10 +654,8 @@ class TestRegisterConversation:
         from nanoclaw.ipc.task_handler import process_task_ipc
 
         tenant = await _create_tenant_in_db("Acme", "acme-reg")
-        role = await _create_role_in_db(tenant.id)
         cw, binding, _ = await _create_coworker_full(
             tenant.id,
-            role.id,
             "Admin Bot",
             "admin-reg",
             is_admin=True,
@@ -872,7 +849,6 @@ class TestMigration:
             create_channel_binding,
             create_conversation,
             create_coworker,
-            create_role,
             create_tenant,
             get_tenant_by_slug,
             set_session,
@@ -883,7 +859,6 @@ class TestMigration:
         tenant = await get_tenant_by_slug("default")
         if tenant is None:
             tenant = await create_tenant(slug="default", name="Default Tenant")
-        role = await create_role(tenant_id=tenant.id, name="general")
 
         for jid, group in legacy.items():
             prefix = "tg:"
@@ -891,7 +866,6 @@ class TestMigration:
 
             coworker = await create_coworker(
                 tenant_id=tenant.id,
-                role_id=role.id,
                 name=group.name,
                 folder=group.folder,
                 is_admin=group.is_main,
@@ -972,7 +946,6 @@ class TestVolumeMountPaths:
         cw = Coworker(
             id="cw1",
             tenant_id="t1",
-            role_id="r1",
             name="Bot",
             folder="bot-vol",
         )
@@ -1010,7 +983,6 @@ class TestVolumeMountPaths:
         cw = Coworker(
             id="cw1",
             tenant_id="t-acme",
-            role_id="r1",
             name="Bot",
             folder="bot-tp",
         )
@@ -1034,7 +1006,7 @@ class TestVolumeMountPaths:
         shared = tmp_path / "tenants" / "t1" / "shared"
         shared.mkdir(parents=True)
 
-        cw = Coworker(id="cw1", tenant_id="t1", role_id="r1", name="Bot", folder="bot-sh")
+        cw = Coworker(id="cw1", tenant_id="t1", name="Bot", folder="bot-sh")
 
         with (
             patch("nanoclaw.container.runner.DATA_DIR", tmp_path),
@@ -1061,18 +1033,15 @@ class TestMessageIsolation:
         from nanoclaw.db.pg import get_messages_since
 
         tenant = await _create_tenant_in_db("Acme", "acme-iso")
-        role = await _create_role_in_db(tenant.id)
 
         _ops_cw, _ops_bind, ops_convs = await _create_coworker_full(
             tenant.id,
-            role.id,
             "Ops Bot",
             "ops-iso",
             chat_ids=["-300"],
         )
         _cs_cw, _cs_bind, cs_convs = await _create_coworker_full(
             tenant.id,
-            role.id,
             "CS Bot",
             "cs-iso",
             chat_ids=["-300"],
@@ -1116,10 +1085,8 @@ class TestTaskSchedulingPerCoworker:
         from nanoclaw.ipc.task_handler import process_task_ipc
 
         tenant = await _create_tenant_in_db("Acme", "acme-task")
-        role = await _create_role_in_db(tenant.id)
         cw, _, _ = await _create_coworker_full(
             tenant.id,
-            role.id,
             "Ops Bot",
             "ops-task",
             is_admin=True,
@@ -1179,7 +1146,6 @@ class TestTaskSchedulingPerCoworker:
         from nanoclaw.ipc.task_handler import process_task_ipc
 
         tenant = await _create_tenant_in_db("Acme", "acme-task-auth")
-        await _create_role_in_db(tenant.id)
 
         class FakeDeps:
             async def send_message(self, jid: str, text: str) -> None:

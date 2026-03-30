@@ -65,7 +65,6 @@ async def test_multi_tenant_schema_creation(e2e_env: Path) -> None:
         create_channel_binding,
         create_conversation,
         create_coworker,
-        create_role,
         create_tenant,
     )
 
@@ -74,13 +73,8 @@ async def test_multi_tenant_schema_creation(e2e_env: Path) -> None:
     assert tenant.name == "Test Corp"
     assert tenant.max_concurrent_containers == 5
 
-    role = await create_role(tenant_id=tenant.id, name="general")
-    assert role.id
-    assert role.agent_backend == "claude-code"
-
     coworker = await create_coworker(
         tenant_id=tenant.id,
-        role_id=role.id,
         name="Test Bot",
         folder="test-bot",
         is_admin=True,
@@ -115,15 +109,13 @@ async def test_session_per_conversation(e2e_env: Path) -> None:
         create_channel_binding,
         create_conversation,
         create_coworker,
-        create_role,
         create_tenant,
         get_session,
         set_session,
     )
 
     tenant = await create_tenant(name="T", slug="t-sess")
-    role = await create_role(tenant_id=tenant.id, name="r")
-    cw = await create_coworker(tenant_id=tenant.id, role_id=role.id, name="Bot", folder="bot")
+    cw = await create_coworker(tenant_id=tenant.id, name="Bot", folder="bot")
     b = await create_channel_binding(coworker_id=cw.id, tenant_id=tenant.id, channel_type="tg")
     conv = await create_conversation(
         tenant_id=tenant.id,
@@ -143,15 +135,13 @@ async def test_messages_per_conversation(e2e_env: Path) -> None:
         create_channel_binding,
         create_conversation,
         create_coworker,
-        create_role,
         create_tenant,
         get_messages_since,
         store_message,
     )
 
     tenant = await create_tenant(name="T", slug="t-msg")
-    role = await create_role(tenant_id=tenant.id, name="r")
-    cw = await create_coworker(tenant_id=tenant.id, role_id=role.id, name="Bot", folder="bot2")
+    cw = await create_coworker(tenant_id=tenant.id, name="Bot", folder="bot2")
     b = await create_channel_binding(coworker_id=cw.id, tenant_id=tenant.id, channel_type="tg")
     conv = await create_conversation(
         tenant_id=tenant.id,
@@ -180,7 +170,6 @@ async def test_tasks_per_coworker(e2e_env: Path) -> None:
     from nanoclaw.core.types import ScheduledTask
     from nanoclaw.db.pg import (
         create_coworker,
-        create_role,
         create_task,
         create_tenant,
         get_task_by_id,
@@ -188,8 +177,7 @@ async def test_tasks_per_coworker(e2e_env: Path) -> None:
     )
 
     tenant = await create_tenant(name="T", slug="t-task")
-    role = await create_role(tenant_id=tenant.id, name="r")
-    cw = await create_coworker(tenant_id=tenant.id, role_id=role.id, name="Bot", folder="bot3")
+    cw = await create_coworker(tenant_id=tenant.id, name="Bot", folder="bot3")
 
     import uuid
 

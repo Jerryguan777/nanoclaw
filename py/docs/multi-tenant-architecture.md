@@ -9,8 +9,8 @@ NanoClaw started as a single-user personal AI assistant: one person, one agent, 
 As the project evolved toward a general-purpose **AI Coworker platform**, we needed to support:
 
 - Multiple **organizations** (tenants) sharing the same infrastructure
-- Multiple **AI roles** per tenant (operations AI, customer service AI, etc.)
-- Multiple **instances** of each role (one per product line, one per region, etc.)
+- Multiple **AI coworkers** per tenant (operations AI, customer service AI, etc.)
+- Multiple coworkers of the same type (one per product line, one per region, etc.)
 - Each instance interacting with users across **multiple chat channels** simultaneously
 - **Multiple human users** within an organization, each with appropriate access
 
@@ -23,12 +23,9 @@ This document describes how we got from the single-user design to the multi-tena
 ```
 Tenant (organization)
 │
-├── Role (AI agent template)
-│   └── Defines: system prompt, tools, skills, LLM backend
-│
-├── Coworker (running instance of a Role)
+├── Coworker (AI agent)
+│   ├── Carries its own config: system prompt, tools, skills, LLM backend
 │   ├── Has its own workspace (files, logs)
-│   ├── May override Role defaults
 │   ├── Identified by independent bot identity per channel
 │   └── Can operate in multiple chat groups simultaneously
 │
@@ -44,15 +41,7 @@ Tenant (organization)
 
 **Tenant** is straightforward — organizational isolation boundary.
 
-**Role vs Coworker** is the key design split. We considered two alternatives:
-
-1. **Flat coworkers only** — each coworker carries its own full config (prompt, tools, etc.)
-2. **Role template + Coworker instance** — role defines the template, coworker inherits and optionally overrides
-
-We chose option 2 because:
-- A company with 5 operations AI coworkers (one per product line) shouldn't configure the same prompt and tools 5 times
-- When the operations team updates their SOPs, changing the Role template propagates to all coworkers
-- It maps naturally to how companies think: "We have an operations AI *role*, and we've deployed it for product lines A, B, and C"
+**Coworker** is the central entity — an AI agent with its own identity, configuration (system prompt, tools, skills, LLM backend), workspace, and concurrency limits. We considered splitting this into a "Role template + Coworker instance" model (where Role defines the shared config and Coworker inherits it), but found it to be over-engineering for the current stage: no code uses template reuse, every coworker creation would require a role to exist first, and the extra table/JOIN/CRUD adds complexity with zero benefit. If template reuse is needed later, adding a `roles` table with a FK is a straightforward addition.
 
 **Conversation** emerged from a specific realization: when the same Coworker operates in multiple Telegram groups, the **file workspace should be shared** (same product data, same codebase) but the **conversation memory should be independent** (different groups discuss different topics).
 
@@ -206,28 +195,28 @@ Container mounts:
 
 **Why read-only shared space?** The shared knowledge base (SOPs, product manuals, market data) is curated content that coworkers read but shouldn't modify. Write access would create conflicts between coworkers.
 
-### 7. Role Configuration Inheritance
+### 7. Coworker Configuration
 
-**Decision**: Coworkers inherit from their Role template and can override specific fields.
+**Decision**: Each Coworker carries its own complete configuration directly — no template indirection.
 
 ```python
 @dataclass
 class CoworkerConfig:
-    """Runtime config — merged from Role + Coworker at load time."""
-    # From Role (template):
-    system_prompt: str | None
-    tools: list[str]
-    skills: list[str]
-    agent_backend: str          # "claude-code" or "pi-mono"
-
-    # From Coworker (instance, may override):
-    name: str                   # coworker's display name
+    """Runtime config loaded from coworkers table."""
+    name: str                   # coworker's display name (trigger derived from this)
     folder: str                 # workspace path
+    system_prompt: str | None   # prompt for the LLM
+    tools: list[str]            # tool allowlist
+    skills: list[str]           # skill names
+    agent_backend: str          # "claude-code" or "pi-mono"
     max_concurrent: int         # concurrency limit
     container_config: dict      # resource overrides (memory, CPU)
+    is_admin: bool              # legacy from is_main
 ```
 
-The merge happens at load time, not query time — `OrchestratorState` stores the merged `CoworkerConfig`, so there's no runtime cost to the inheritance.
+All fields live on the `coworkers` table. No join, no merge, no template layer. If multiple coworkers need the same config, they're configured independently — duplication is acceptable at this scale and is easier to reason about than a template inheritance system.
+
+**Why not a Role template layer?** We initially designed one (`roles` table with FK from `coworkers`), then removed it because: no code used the template-reuse capability, every coworker creation required a role to exist first, and the extra table added complexity with no current benefit. If template reuse becomes necessary (e.g., a management UI for "create 5 operations AIs from the same template"), adding it back is straightforward.
 
 ## How It Evolved from Single-Tenant
 
@@ -258,7 +247,7 @@ These are explicitly deferred to future steps:
 - **Approval workflows** (L1/L2/L3 authorization with human-in-the-loop)
 - **A2A collaboration** (coworkers delegating tasks to each other)
 - **PostgreSQL Row-Level Security** (tenant isolation is currently at application level via WHERE clauses; RLS is a future safety net)
-- **Role/Coworker management UI** (entities are managed via SQL or migration scripts, not a web dashboard)
+- **Coworker management UI** (entities are managed via SQL or migration scripts, not a web dashboard)
 - **Fine-grained user permissions** (the `users` table exists but only basic tenant membership is enforced)
 
 Correspondingly, the database schema does NOT include columns for unimplemented features. Fields like `authorization`, `a2a_config`, or `config_overrides` are added when their features are built, not as placeholders. This keeps the schema honest — every column has code that reads and writes it.
@@ -271,37 +260,33 @@ Correspondingly, the database schema does NOT include columns for unimplemented 
                     └────┬─────┘
            ┌─────────────┼─────────────┐
            ▼             ▼             ▼
-       ┌───────┐    ┌────────┐    ┌───────┐
-       │ User  │    │  Role  │    │Shared │
-       └───────┘    └───┬────┘    │Space  │
-                        │         └───────┘
-                        ▼
-                  ┌───────────┐
-                  │ Coworker  │─── folder (workspace)
-                  └─────┬─────┘
-                        │
-              ┌─────────┼──────────┐
-              ▼                    ▼
-      ┌───────────────┐   ┌──────────────┐
-      │ChannelBinding │   │ScheduledTask │
-      │(bot identity) │   └──────────────┘
-      └───────┬───────┘
+       ┌───────┐   ┌───────────┐  ┌───────┐
+       │ User  │   │ Coworker  │  │Shared │
+       └───────┘   │(config +  │  │Space  │
+                   │ workspace)│  └───────┘
+                   └─────┬─────┘
+                         │
+               ┌─────────┼──────────┐
+               ▼                    ▼
+       ┌───────────────┐   ┌──────────────┐
+       │ChannelBinding │   │ScheduledTask │
+       │(bot identity) │   └──────────────┘
+       └───────┬───────┘
+               │
+               ▼
+       ┌──────────────┐
+       │ Conversation │─── session (independent memory)
+       └──────┬───────┘
               │
               ▼
-      ┌──────────────┐
-      │ Conversation │─── session (independent memory)
-      └──────┬───────┘
-             │
-             ▼
-      ┌──────────────┐
-      │   Messages   │
-      └──────────────┘
+       ┌──────────────┐
+       │   Messages   │
+       └──────────────┘
 ```
 
 ### Key Relationships
 
-- **Tenant → Role**: One-to-many. A tenant defines role templates.
-- **Role → Coworker**: One-to-many. A role template can have multiple instances.
+- **Tenant → Coworker**: One-to-many. Each coworker carries its own complete config (prompt, tools, backend).
 - **Coworker → ChannelBinding**: One-to-many (one per channel type). Each binding has bot credentials.
 - **ChannelBinding → Conversation**: One-to-many. One bot in multiple chat groups.
 - **Conversation → Session**: One-to-one. Independent conversation memory.
@@ -318,8 +303,7 @@ The schema below includes only columns with defined purpose — no placeholder f
 |-------|-------------|---------|
 | `tenants` | `id`, `name`, `max_concurrent_containers`, `last_message_cursor` | Organizational boundary and limits |
 | `users` | `id`, `tenant_id`, `name`, `role`, `channel_ids` | Human users (reserved for future permission control) |
-| `roles` | `id`, `tenant_id`, `name`, `agent_backend`, `system_prompt`, `tools`, `skills` | AI agent templates |
-| `coworkers` | `id`, `tenant_id`, `role_id`, `name`, `folder`, `is_admin`, `container_config`, `max_concurrent` | Running instances of roles |
+| `coworkers` | `id`, `tenant_id`, `name`, `folder`, `agent_backend`, `system_prompt`, `tools`, `skills`, `is_admin`, `container_config`, `max_concurrent` | AI agents with full config |
 | `channel_bindings` | `id`, `coworker_id`, `channel_type`, `credentials`, `bot_display_name` | Per-coworker bot identities |
 | `conversations` | `id`, `coworker_id`, `channel_binding_id`, `channel_chat_id`, `requires_trigger`, `last_agent_invocation` | Per-chat contexts with independent session; trigger text derived from `coworker.name` |
 
@@ -363,7 +347,7 @@ The schema below includes only columns with defined purpose — no placeholder f
    │  - Mount coworker workspace (shared)
    │  - Mount conversation session dir (independent)
    │  - Mount tenant shared knowledge (read-only)
-   │  - Pass coworker's Role config (prompt, tools, backend)
+   │  - Pass coworker's config (prompt, tools, backend)
    │
 8. Agent executes, results flow back via NATS
    │  - send_message MCP tool → immediate delivery (Channel 4)
