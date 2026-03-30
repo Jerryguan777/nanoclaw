@@ -221,10 +221,17 @@ async def _handle_incoming(
     if not result:
         return
 
-    _cw_state, conv_state = result
+    cw_state, conv_state = result
     conv = conv_state.conversation
 
-    # Sender allowlist check (allowlist keys may use prefixed JIDs like "tg:12345")
+    # In groups with multiple bots, each bot receives all messages.
+    # Only store the message if it's relevant to THIS coworker:
+    # - conversation doesn't require trigger (DM or admin), OR
+    # - message content matches this coworker's trigger pattern
+    if is_group and conv.requires_trigger and not cw_state.config.trigger_pattern.search(text.strip()):
+        return  # Not for this coworker — skip silently
+
+    # Sender allowlist check
     cfg = load_sender_allowlist()
     if should_drop_message(chat_id, cfg) and not is_sender_allowed(chat_id, sender, cfg):
         if cfg.log_denied:
