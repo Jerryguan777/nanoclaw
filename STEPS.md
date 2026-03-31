@@ -9,10 +9,11 @@
 ## 执行顺序
 
 ```
-Step 1（文件重组）──→ Step 2（NATS IPC）──→ Step 3（AgentExecutor + Docker API）──→ Step 4（SQLite → PostgreSQL）
+Step 1 → Step 2 → Step 3 → Step 4 → Step 5 → Step 5.1 → Step 6
+(重组)   (NATS)  (Executor) (PG)    (多租户)  (合并Role) (RoleMesh独立Repo)
 ```
 
-严格顺序执行。Step 1、2、3 已完成。Step 4 将 SQLite 替换为 PostgreSQL，所有 db 函数改为 async，schema 预留 `tenant_id` 为多租户做准备。
+Step 1-5.1 已完成。Step 6 将 `py/` 独立为新 GitHub repo **RoleMesh**。
 
 ---
 
@@ -1757,3 +1758,1154 @@ $(gh issue view 8 --json title,body --jq '"# " + .title + "\n\n" + .body')
 ```
 
 > 替换为实际 Issue 编号。
+
+---
+
+## Step 5：多租户 + 多 Coworker 架构
+
+**目标**：将 NanoClaw 从单租户扩展为多租户、多 Coworker 架构。每个租户可有多种 AI 角色（Role 模板），每种角色可有多个实例（Coworker），每个 Coworker 通过独立 bot 身份在多个聊天群中与用户交互。容器并发控制支持全局 + 租户 + Coworker 三级限流。
+
+**前置条件**：Step 4（PostgreSQL）完成。所有表已有 `tenant_id` 列，所有查询已带 `WHERE tenant_id = $1`。
+
+**不包含**：审批流（L1/L2/L3）、A2A 跨 Coworker 协作、Role/Coworker 管理 UI、用户权限精细控制、Web Dashboard、PG RLS Policy。
+
+### 创建 Issue 命令
+
+```bash
+gh issue create \
+  --title "feat: multi-tenant multi-coworker architecture" \
+  --label "enhancement,python-rewrite" \
+  --body "$(cat <<'ISSUE_EOF'
+## Context
+
+After Step 4, NanoClaw has PostgreSQL with \`tenant_id\` columns and \`DEFAULT_TENANT = "default"\` throughout. The single-tenant architecture uses module-level global variables (\`_sessions\`, \`_registered_groups\`, \`_queue\`, \`_channels\`) and treats each \`RegisteredGroup\` as a 1:1 mapping between a chat and an agent.
+
+This step transforms the architecture to support:
+- Multiple **tenants** (organizations)
+- Multiple **roles** (AI agent templates: operations AI, logistics AI, etc.)
+- Multiple **coworkers** (role instances, each with own workspace)
+- Multiple **conversations** per coworker (same coworker in different Telegram groups / Slack channels)
+- Per-coworker **bot identity** (each coworker has its own Telegram bot, etc.)
+- Three-level **concurrency control** (global + per-tenant + per-coworker)
+
+This is **Step 5** of the AI Coworker Platform. See \`STEPS.md\` for the full plan.
+
+**Prerequisites**: Steps 1-4 completed (src layout, NATS IPC, AgentExecutor + DockerRuntime, PostgreSQL).
+
+## Concept Hierarchy
+
+\`\`\`
+Tenant "Acme Corp"
+├── Role "Operations AI" (template: prompt + tools + skills + backend)
+│   ├── Coworker "Ops AI - Product Line A"
+│   │   ├── ChannelBinding: Telegram bot @acme_ops_a_bot
+│   │   │   ├── Conversation: tg group 1001
+│   │   │   └── Conversation: tg group 1002
+│   │   └── ChannelBinding: Slack bot
+│   │       └── Conversation: slack channel C789
+│   │
+│   └── Coworker "Ops AI - Product Line B"
+│       └── ChannelBinding: Telegram bot @acme_ops_b_bot
+│           └── Conversation: tg group 2001
+│
+├── Role "Customer Service AI"
+│   └── Coworker "CS AI"
+│       └── ChannelBinding: Telegram bot @acme_cs_bot
+│           └── Conversation: tg group 1001 (same group, different bot)
+│
+├── SharedSpace (cross-coworker shared knowledge)
+└── Users: Zhang San (admin), Li Si (member)
+\`\`\`
+
+Key design decisions:
+- **Workspace** is per-coworker (shared across conversations) — same coworker in different groups operates on same files
+- **Session** is per-conversation — different groups have independent conversation memory
+- **Bot identity** is per-coworker per-channel-type — each coworker has its own Telegram bot, Slack app, etc.
+- **Trigger pattern** is per-conversation (different groups may have different trigger rules), but the @mention name comes from the coworker
+
+## Mapping from Current Concepts
+
+| Current | Multi-tenant | Relationship |
+|---------|-------------|-------------|
+| \`DEFAULT_TENANT = "default"\` | \`tenant_id\` (dynamic, from routing) | Parameter replaces constant |
+| \`ASSISTANT_NAME\` (global) | \`coworker.name\` (per-coworker) | Config becomes per-entity |
+| \`TRIGGER_PATTERN\` (global) | Derived from \`coworker.name\` | Trigger text = coworker name; \`conversation.requires_trigger\` controls on/off |
+| \`RegisteredGroup\` | \`Coworker\` + \`Conversation\` | **Split**: 1 group = 1 coworker + 1 conversation |
+| \`group.folder\` | \`coworker.folder\` | Path becomes \`tenants/{tid}/coworkers/{folder}/\` |
+| \`group.is_main\` | \`coworker.is_admin\` | Renamed, one per tenant |
+| \`chatJid\` | \`conversation.channel_chat_id\` | 1 coworker -> N conversations |
+| \`session\` (per group) | \`session\` (per conversation) | Session scope narrows |
+| \`GroupQueue\` (global) | \`OrchestratorState\` + 3-level scheduling | Restructured |
+| \`Channel\` (global singleton) | \`ChannelGateway\` + per-coworker bots | Gateway manages multiple bots |
+| Module-level globals | \`OrchestratorState\` class | All state in structured object |
+
+## New Database Tables
+
+\`\`\`sql
+CREATE TABLE tenants (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    slug TEXT UNIQUE,                        -- URL-friendly identifier (optional, for future Web API)
+    name TEXT NOT NULL,
+    plan TEXT,                               -- starter/pro/enterprise (optional, for future billing)
+    max_concurrent_containers INT DEFAULT 5, -- per-tenant concurrency limit
+    last_message_cursor TIMESTAMPTZ,         -- replaces router_state "last_timestamp"
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- Users: reserved for future permission control (Step 5 creates the table but
+-- does not implement user-based authorization)
+CREATE TABLE users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id),
+    name TEXT NOT NULL,
+    email TEXT,
+    role TEXT DEFAULT 'member',              -- admin / manager / member
+    channel_ids JSONB DEFAULT '{}',          -- {"telegram": "user123", "slack": "U456"}
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE roles (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id),
+    name TEXT NOT NULL,                      -- "Operations AI"
+    agent_backend TEXT DEFAULT 'claude-code', -- AgentBackendConfig.name
+    system_prompt TEXT,
+    tools JSONB DEFAULT '[]',                -- tool allowlist: ["Bash", "Read", ...]
+    skills JSONB DEFAULT '[]',               -- skill names
+    created_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE (tenant_id, name)
+);
+
+CREATE TABLE coworkers (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id),
+    role_id UUID NOT NULL REFERENCES roles(id),
+    name TEXT NOT NULL,                      -- "Ops AI - Product Line A"
+    folder TEXT NOT NULL,                    -- filesystem namespace
+    is_admin BOOLEAN DEFAULT FALSE,          -- legacy from is_main; refactor target
+    container_config JSONB,                  -- resource overrides: {"memory_limit": "1g", "timeout": 600000}
+    max_concurrent INT DEFAULT 2,            -- per-coworker concurrency limit
+    status TEXT DEFAULT 'active',
+    created_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE (tenant_id, folder)
+);
+
+-- Bot credentials: per-coworker per-channel-type
+CREATE TABLE channel_bindings (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    coworker_id UUID NOT NULL REFERENCES coworkers(id) ON DELETE CASCADE,
+    tenant_id UUID NOT NULL REFERENCES tenants(id),  -- redundant (from coworker) but avoids JOIN
+    channel_type TEXT NOT NULL,              -- "telegram" / "slack" / "web"
+    credentials JSONB NOT NULL,              -- {"bot_token": "xxx"}
+    bot_display_name TEXT,                   -- "@acme_ops_bot"
+    status TEXT DEFAULT 'active',
+    created_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE (coworker_id, channel_type)
+);
+
+-- Conversation context: per-coworker per-chat
+CREATE TABLE conversations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id),   -- redundant but avoids JOIN in hot path
+    coworker_id UUID NOT NULL REFERENCES coworkers(id) ON DELETE CASCADE,  -- same
+    channel_binding_id UUID NOT NULL REFERENCES channel_bindings(id),
+    channel_chat_id TEXT NOT NULL,           -- tg group ID / slack channel ID
+    name TEXT,                               -- display name of the chat
+    requires_trigger BOOLEAN DEFAULT TRUE,   -- FALSE for DMs / Web UI; trigger text derived from coworker.name
+    last_agent_invocation TIMESTAMPTZ,       -- replaces router_state "last_agent_timestamp"
+    created_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE (channel_binding_id, channel_chat_id)
+);
+\`\`\`
+
+## Existing Tables: Rewrite with Consistent Types
+
+All existing tables are rewritten with UUID \`tenant_id\` and TIMESTAMPTZ time fields, replacing the legacy TEXT types from Step 4. Legacy tables (\`chats\`, \`registered_groups\`, \`router_state\`) are dropped after migration.
+
+\`\`\`sql
+-- Sessions: per-conversation
+CREATE TABLE sessions (
+    conversation_id UUID PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+    tenant_id UUID NOT NULL REFERENCES tenants(id),
+    coworker_id UUID NOT NULL REFERENCES coworkers(id),
+    session_id TEXT NOT NULL
+);
+
+-- Messages: keyed by conversation (not chat_jid)
+CREATE TABLE messages (
+    id TEXT NOT NULL,
+    tenant_id UUID NOT NULL REFERENCES tenants(id),
+    conversation_id UUID NOT NULL REFERENCES conversations(id),
+    sender TEXT,
+    sender_name TEXT,
+    content TEXT,
+    timestamp TIMESTAMPTZ NOT NULL,
+    is_from_me BOOLEAN DEFAULT FALSE,
+    is_bot_message BOOLEAN DEFAULT FALSE,
+    PRIMARY KEY (tenant_id, id, conversation_id)
+);
+CREATE INDEX idx_messages_ts ON messages(tenant_id, conversation_id, timestamp);
+
+-- Scheduled tasks: keyed by coworker
+CREATE TABLE scheduled_tasks (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id),
+    coworker_id UUID NOT NULL REFERENCES coworkers(id),
+    conversation_id UUID REFERENCES conversations(id),  -- which chat triggered it (NULL for API-created)
+    prompt TEXT NOT NULL,
+    schedule_type TEXT NOT NULL,              -- "cron" / "interval" / "once"
+    schedule_value TEXT NOT NULL,
+    context_mode TEXT DEFAULT 'isolated',     -- "group" / "isolated"
+    next_run TIMESTAMPTZ,
+    last_run TIMESTAMPTZ,
+    last_result TEXT,
+    status TEXT DEFAULT 'active',
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX idx_tasks_next ON scheduled_tasks(tenant_id, next_run);
+CREATE INDEX idx_tasks_status ON scheduled_tasks(tenant_id, status);
+
+-- Task run logs: execution history
+CREATE TABLE task_run_logs (
+    id SERIAL PRIMARY KEY,
+    tenant_id UUID NOT NULL REFERENCES tenants(id),
+    task_id UUID NOT NULL REFERENCES scheduled_tasks(id) ON DELETE CASCADE,
+    run_at TIMESTAMPTZ NOT NULL,
+    duration_ms INT NOT NULL,
+    status TEXT NOT NULL,                    -- "success" / "error"
+    result TEXT,                             -- first 500 chars of agent output (truncated)
+    error TEXT
+);
+CREATE INDEX idx_task_run_logs ON task_run_logs(task_id, run_at);
+
+-- Tenants: add message cursor (replaces router_state "last_timestamp")
+-- (this column is on the tenants table since the cursor is per-tenant)
+-- ALTER TABLE tenants ADD COLUMN last_message_cursor TIMESTAMPTZ;
+-- Note: included in the CREATE TABLE above for new installs; migration adds it
+\`\`\`
+
+## Tables Dropped After Migration
+
+\`\`\`sql
+-- These legacy tables are replaced by the new schema:
+DROP TABLE IF EXISTS router_state;       -- replaced by conversations.last_agent_invocation + tenants.last_message_cursor
+DROP TABLE IF EXISTS registered_groups;  -- replaced by coworkers + channel_bindings + conversations
+DROP TABLE IF EXISTS chats;              -- replaced by conversations
+\`\`\`
+
+## Filesystem Layout
+
+\`\`\`
+data/tenants/{tenant_id}/
+├── coworkers/{folder}/
+│   ├── workspace/               # mount /workspace/group (rw), shared across conversations
+│   ├── sessions/
+│   │   ├── {conversation_id_1}/ # session for tg group A
+│   │   └── {conversation_id_2}/ # session for tg group B (independent)
+│   ├── logs/
+│   └── CLAUDE.md                # coworker-level memory
+├── shared/                      # mount /workspace/shared (ro)
+│   └── knowledge/
+└── env/
+\`\`\`
+
+## Runtime Architecture
+
+### OrchestratorState (replaces module-level globals)
+
+\`\`\`python
+@dataclass
+class CoworkerConfig:
+    \"\"\"Runtime config, merged from Role + Coworker tables.\"\"\"
+    id: str
+    tenant_id: str
+    name: str
+    folder: str
+    system_prompt: str | None
+    trigger_pattern: re.Pattern[str]          # derived from name: re.compile(rf"@{name}\\b", re.I)
+    agent_backend: str
+    container_image: str | None
+    max_concurrent: int
+    role_config: dict[str, object]
+    tools: list[str]
+    skills: list[str]
+
+@dataclass
+class ConversationState:
+    \"\"\"Per-conversation runtime state.\"\"\"
+    conversation: Conversation
+    session_id: str | None
+    last_agent_timestamp: str
+
+@dataclass
+class CoworkerState:
+    \"\"\"Per-coworker runtime state.\"\"\"
+    config: CoworkerConfig
+    conversations: dict[str, ConversationState]    # channel_chat_id -> state
+    channel_bindings: dict[str, ChannelBinding]    # channel_type -> binding
+
+class OrchestratorState:
+    \"\"\"All runtime state, structured by tenant and coworker.\"\"\"
+    tenants: dict[str, Tenant]                     # tenant_id -> Tenant
+    coworkers: dict[str, CoworkerState]            # coworker_id -> state
+
+    # Three-level scheduling counters
+    global_active: int = 0
+    global_limit: int = 20
+    tenant_active: dict[str, int] = field(default_factory=dict)
+    coworker_active: dict[str, int] = field(default_factory=dict)
+
+    def can_start_container(self, tenant_id: str, coworker_id: str) -> bool:
+        if self.global_active >= self.global_limit:
+            return False
+        tenant = self.tenants[tenant_id]
+        if self.tenant_active.get(tenant_id, 0) >= tenant.max_concurrent_containers:
+            return False
+        cw = self.coworkers[coworker_id]
+        if self.coworker_active.get(coworker_id, 0) >= cw.config.max_concurrent:
+            return False
+        return True
+\`\`\`
+
+### ChannelGateway (replaces global Channel singletons)
+
+\`\`\`python
+class ChannelGateway(Protocol):
+    \"\"\"Manages multiple bot instances for one channel type.\"\"\"
+    async def add_binding(self, binding: ChannelBinding) -> None: ...
+    async def remove_binding(self, binding_id: str) -> None: ...
+    async def send_message(self, binding_id: str, chat_id: str, text: str) -> None: ...
+    async def shutdown(self) -> None: ...
+
+class TelegramGateway:
+    \"\"\"Manages multiple Telegram bots (one per coworker).\"\"\"
+    _bots: dict[str, TelegramBot]      # binding_id -> bot instance
+    _on_message: MessageCallback
+
+    async def add_binding(self, binding: ChannelBinding) -> None:
+        bot = TelegramBot(binding.credentials["bot_token"])
+        bot.on_message = lambda update: self._on_message(binding.id, update)
+        await bot.start()
+        self._bots[binding.id] = bot
+
+class SlackGateway:
+    _apps: dict[str, SlackApp]
+    # ... same pattern
+
+# Orchestrator holds one gateway per channel type
+_gateways: dict[str, ChannelGateway] = {
+    "telegram": TelegramGateway(on_message=_handle_incoming),
+    "slack": SlackGateway(on_message=_handle_incoming),
+}
+\`\`\`
+
+### Message Routing
+
+\`\`\`python
+async def _handle_incoming(binding_id: str, chat_id: str, sender_id: str, text: str):
+    \"\"\"Unified message handler for all channels.\"\"\"
+    # 1. Resolve context
+    binding = await db.get_channel_binding(binding_id)
+    coworker_state = orchestrator.coworkers[binding.coworker_id]
+    conversation = coworker_state.conversations.get(chat_id)
+    if not conversation:
+        return  # Unknown chat, ignore
+
+    # 2. Check trigger
+    if conversation.conversation.requires_trigger:
+        if not coworker_state.config.trigger_pattern.search(text):
+            return  # trigger text derived from coworker.name
+
+    # 3. Store message
+    await db.store_message(
+        tenant_id=binding.tenant_id,
+        conversation_id=conversation.conversation.id,
+        sender=sender_id, content=text, ...
+    )
+
+    # 4. Three-level concurrency check + enqueue
+    if orchestrator.can_start_container(binding.tenant_id, binding.coworker_id):
+        await _execute_coworker(coworker_state, conversation)
+    else:
+        scheduler.enqueue(binding.coworker_id, conversation)
+\`\`\`
+
+### Agent Execution
+
+\`\`\`python
+async def _execute_coworker(cw: CoworkerState, conv: ConversationState):
+    agent_input = AgentInput(
+        prompt=formatted_messages,
+        group_folder=cw.config.folder,
+        chat_jid=conv.conversation.channel_chat_id,
+        is_main=cw.config.is_admin,  # from coworker, not conversation
+        session_id=conv.session_id,              # per-conversation
+        system_prompt=cw.config.system_prompt,    # from Role
+        role_config=cw.config.role_config,
+        tenant_id=cw.config.tenant_id,
+        coworker_id=cw.config.id,
+    )
+    backend = get_backend_config(cw.config.agent_backend, cw.config.container_image)
+    output = await executor.execute(agent_input, on_process, on_output)
+    if output.new_session_id:
+        conv.session_id = output.new_session_id
+        await db.set_session(conv.conversation.id, output.new_session_id)
+\`\`\`
+
+### Container Volume Mounts
+
+\`\`\`python
+def build_volume_mounts(
+    tenant_id: str,
+    coworker: Coworker,
+    conversation_id: str,
+    is_admin: bool,
+    backend_config: AgentBackendConfig | None = None,
+) -> list[VolumeMount]:
+    tenant_dir = DATA_DIR / "tenants" / tenant_id
+    coworker_dir = tenant_dir / "coworkers" / coworker.folder
+    shared_dir = tenant_dir / "shared"
+    session_dir = coworker_dir / "sessions" / conversation_id
+
+    mounts = [
+        VolumeMount(str(coworker_dir / "workspace"), "/workspace/group", readonly=False),
+        VolumeMount(str(shared_dir), "/workspace/shared", readonly=True),
+        VolumeMount(str(session_dir), "/workspace/sessions", readonly=False),
+        VolumeMount(str(coworker_dir / "logs"), "/workspace/logs", readonly=False),
+    ]
+    # ... backend_config handling
+    return mounts
+\`\`\`
+
+### NATS Subject Naming
+
+\`\`\`
+# Agent IPC (job_id is globally unique, unchanged)
+agent.{job_id}.results / .input / .messages / .tasks / .close
+
+# KV keys: add tenant prefix for snapshots
+agent-init.{job_id}                                    # unchanged
+snapshots.{tenant_id}.{coworker_folder}.tasks          # add tenant prefix
+snapshots.{tenant_id}.{coworker_folder}.groups         # add tenant prefix
+\`\`\`
+
+## Data Migration Script
+
+\`\`\`python
+async def migrate_to_multi_tenant():
+    \"\"\"Migrate existing single-tenant data to new multi-tenant schema.\"\"\"
+    # 1. Create default tenant
+    tenant = await db.create_tenant(slug="default", name="Default Tenant")
+
+    # 2. Create default role
+    role = await db.create_role(
+        tenant_id=tenant.id, name="general",
+    )
+
+    # 3. For each registered_group -> coworker + channel_binding + conversation
+    for jid, group in (await db.get_all_registered_groups_legacy()).items():
+        coworker = await db.create_coworker(
+            tenant_id=tenant.id, role_id=role.id,
+            name=group.name, folder=group.folder, is_admin=group.is_main,
+        )
+        channel_type = _infer_channel_type(jid)
+        binding = await db.create_channel_binding(
+            coworker_id=coworker.id, tenant_id=tenant.id,
+            channel_type=channel_type,
+            credentials=_get_current_credentials(channel_type),
+        )
+        conversation = await db.create_conversation(
+            tenant_id=tenant.id, coworker_id=coworker.id,
+            channel_binding_id=binding.id,
+            channel_chat_id=_extract_chat_id(jid),
+            requires_trigger=group.requires_trigger,
+        )
+        old_session = await db.get_session_legacy(group.folder)
+        if old_session:
+            await db.set_session_new(conversation.id, tenant.id, coworker.id, old_session)
+
+    # 4. Move groups/{folder}/ -> data/tenants/{tid}/coworkers/{folder}/workspace/
+\`\`\`
+
+## Files Summary
+
+### New Files
+
+| File | Content |
+|------|---------|
+| \`src/nanoclaw/core/orchestrator_state.py\` | \`CoworkerConfig\`, \`ConversationState\`, \`CoworkerState\`, \`OrchestratorState\` |
+| \`src/nanoclaw/channels/gateway.py\` | \`ChannelGateway\` Protocol |
+| \`src/nanoclaw/channels/telegram_gateway.py\` | \`TelegramGateway\` (manages multiple bots) |
+| \`src/nanoclaw/channels/slack_gateway.py\` | \`SlackGateway\` |
+| \`scripts/migrate_to_multi_tenant.py\` | Data + filesystem migration |
+
+### Modified Files
+
+| File | Changes |
+|------|---------|
+| \`db/pg.py\` | **Large**: 6 new tables; sessions/messages/tasks add coworker_id/conversation_id; all functions: DEFAULT_TENANT -> tenant_id param with default; CRUD for new entities |
+| \`db/__init__.py\` | Re-export new functions |
+| \`core/types.py\` | **Large**: new dataclasses (Tenant, Role, Coworker, ChannelBinding, Conversation, User); RegisteredGroup deprecated with converter |
+| \`core/config.py\` | Add GLOBAL_MAX_CONTAINERS; remove ASSISTANT_NAME, TRIGGER_PATTERN |
+| \`main.py\` | **Large**: globals -> OrchestratorState; routing via binding -> conversation -> coworker; init gateways |
+| \`container/runner.py\` | **Medium**: paths change to tenants/{tid}/coworkers/{folder}/; build_volume_mounts takes tenant_id + conversation_id |
+| \`container/scheduler.py\` | **Medium**: 3-level concurrency; queue key = coworker_id |
+| \`agent/executor.py\` | **Small**: AgentInput adds tenant_id, coworker_id |
+| \`agent/container_executor.py\` | **Small**: pass tenant_id, coworker_id to NATS KV |
+| \`ipc/protocol.py\` | **Small**: AgentInitData adds tenant_id, coworker_id |
+| \`channels/telegram.py\` | **Large**: refactor to TelegramGateway |
+| \`channels/slack.py\` | **Large**: refactor to SlackGateway |
+| \`channels/registry.py\` | **Medium**: static -> dynamic gateway management |
+| \`orchestration/task_scheduler.py\` | **Medium**: tasks reference coworker_id + conversation_id |
+| \`security/sender_allowlist.py\` | **Medium**: tenant-scoped check using users table |
+| \`agent_runner/ipc_mcp.py\` | **Medium**: \`register_group\` MCP tool → \`register_conversation\`; \`refresh_groups\` adapts to new model |
+| \`ipc/task_handler.py\` | **Medium**: \`register_group\` handler → \`register_conversation\` handler; creates conversation under current coworker's channel_binding |
+
+## MCP Tool Adaptation: register_group → register_conversation
+
+The current \`register_group\` MCP tool lets the admin agent register a new chat by providing a JID, name, folder, and trigger. In the multi-tenant model, this becomes \`register_conversation\` — simpler because the coworker and channel_binding are already known (they're the current agent's context).
+
+\`\`\`python
+# Before (register_group): agent must specify everything
+register_group(jid="tg:12345", name="Sales Team", folder="sales", trigger="@Andy")
+# → creates a new RegisteredGroup row
+
+# After (register_conversation): only the chat ID is needed
+register_conversation(channel_chat_id="-1001234567", name="Sales Team")
+# → creates a new Conversation under the current coworker's channel_binding
+# → coworker_id, tenant_id, channel_binding_id all derived from the agent's context
+# → requires_trigger defaults to TRUE (group chat)
+# → trigger text derived from coworker.name
+\`\`\`
+
+Container-side (\`agent_runner/ipc_mcp.py\`):
+\`\`\`python
+@tool("register_conversation", "Register a new chat group for this coworker.", {"channel_chat_id": str, "name": str})
+async def register_conversation(args):
+    _publish(f"agent.{job_id}.tasks", {
+        "type": "register_conversation",
+        "channel_chat_id": args["channel_chat_id"],
+        "name": args.get("name", ""),
+        "groupFolder": group_folder,  # used to identify the coworker
+        "timestamp": datetime.now().isoformat(),
+    })
+    return _text_result("Conversation registered.")
+\`\`\`
+
+Orchestrator-side (\`ipc/task_handler.py\`):
+\`\`\`python
+elif task_type == "register_conversation":
+    if not is_admin:  # only admin coworker can register new conversations
+        return
+    # Find the coworker and its channel_binding from source context
+    coworker = await db.get_coworker_by_folder(tenant_id, source_group)
+    binding = await db.get_channel_binding(coworker.id, channel_type)
+    await db.create_conversation(
+        tenant_id=tenant_id,
+        coworker_id=coworker.id,
+        channel_binding_id=binding.id,
+        channel_chat_id=data["channel_chat_id"],
+        name=data.get("name"),
+        requires_trigger=True,  # group chat default
+    )
+\`\`\`
+
+Similarly, \`refresh_groups\` becomes \`refresh_conversations\` — the admin coworker can request a re-sync of available chats from the channel gateway.
+
+## Acceptance Criteria
+
+### Data Model
+- [ ] \`tenants\` table with \`max_concurrent_containers\` and \`last_message_cursor\`
+- [ ] \`users\` table (reserved for future permission control)
+- [ ] \`roles\` table (clean: name + agent_backend + system_prompt + tools + skills only — no role_type, no a2a_config, no authorization, no config_overrides)
+- [ ] \`coworkers\` table with \`role_id\`, \`folder\`, \`max_concurrent\`, \`created_at\`
+- [ ] \`channel_bindings\` table with \`created_at\`
+- [ ] \`conversations\` table with \`last_agent_invocation\`, \`requires_trigger\` (no \`is_main\`, no \`trigger_pattern\` — trigger text derived from \`coworker.name\`)
+- [ ] \`sessions\` rewritten: PK = \`conversation_id\`, all UUID types, no \`group_folder\`
+- [ ] \`messages\` rewritten: \`conversation_id\` replaces \`chat_jid\`, all UUID/TIMESTAMPTZ types
+- [ ] \`scheduled_tasks\` rewritten: \`coworker_id\` + \`conversation_id\`, all UUID/TIMESTAMPTZ types
+- [ ] \`task_run_logs\`: UUID \`tenant_id\`, TIMESTAMPTZ \`run_at\`, \`result\` truncated to 500 chars
+- [ ] Legacy tables dropped: \`router_state\`, \`registered_groups\`, \`chats\`
+- [ ] All \`tenant_id\` columns are UUID (not TEXT) — consistent with \`tenants.id\`
+- [ ] All time fields are TIMESTAMPTZ (not TEXT)
+- [ ] Migration script converts existing data to new schema
+
+### Runtime
+- [ ] \`OrchestratorState\` replaces module-level globals
+- [ ] \`CoworkerConfig\` merges Role + Coworker config
+- [ ] Three-level concurrency: global + per-tenant + per-coworker
+- [ ] \`ASSISTANT_NAME\` and \`TRIGGER_PATTERN\` globals removed
+
+### Channels
+- [ ] \`ChannelGateway\` Protocol defined
+- [ ] \`TelegramGateway\` manages multiple bots
+- [ ] \`SlackGateway\` manages multiple apps
+- [ ] Routing: binding_id -> conversation -> coworker
+
+### Agent Execution
+- [ ] \`AgentInput\` includes \`tenant_id\`, \`coworker_id\`
+- [ ] Volume mounts: \`data/tenants/{tid}/coworkers/{folder}/\`
+- [ ] Session dir per-conversation, workspace per-coworker
+- [ ] NATS KV snapshots with tenant prefix
+
+### MCP Tools
+- [ ] \`register_group\` MCP tool renamed to \`register_conversation\` — creates conversation under current coworker's binding
+- [ ] \`register_conversation\` only needs \`channel_chat_id\` and optional \`name\` (coworker/tenant/binding derived from context)
+- [ ] \`refresh_groups\` adapted to \`refresh_conversations\`
+- [ ] Authorization: only admin coworker (\`is_admin=True\`) can register new conversations
+- [ ] \`ipc/task_handler.py\` handles \`register_conversation\` task type
+
+### DB & Compat
+- [ ] All db functions: \`tenant_id\` param with DEFAULT_TENANT default
+- [ ] CRUD for all new entities
+- [ ] \`RegisteredGroup\` deprecated with converter function
+- [ ] \`ruff check . && mypy --strict src/nanoclaw && pytest\` pass
+
+## Important Notes
+
+- **Working directory**: Project root (\`py/\` directory)
+- **DEFAULT_TENANT stays as default param** — \`tenant_id: str = DEFAULT_TENANT\` for single-tenant compat
+- **Gateway pattern**: One gateway per channel TYPE managing multiple bots. NOT one gateway per bot.
+- **Session per-conversation, workspace per-coworker** — deliberate design. Same coworker shares files across groups, independent conversation memory.
+- **RegisteredGroup backward compat**: Provide converter, remove in follow-up.
+- **Bot identity**: Each coworker has own bot per channel type. Users @mention different bots in same group.
+- **No RLS** — tenant isolation via WHERE clauses. RLS is future safety net.
+- **Filesystem migration**: Move \`groups/{folder}/\` to \`data/tenants/default/coworkers/{folder}/workspace/\`
+- **MCP tool rename**: \`register_group\` → \`register_conversation\`, \`refresh_groups\` → \`refresh_conversations\`. The new tools are simpler — coworker/tenant/binding context is known, only \`channel_chat_id\` is needed.
+- **Schema is clean**: No placeholder JSONB fields without defined purpose. Fields for future features (a2a, authorization, RLS) are added when those features are implemented, not before.
+- **Branch**: Create from \`python-rewrite\` branch
+
+## Known Pitfalls (from prior implementation attempt)
+
+These issues were discovered during a previous implementation of this step. Read carefully to avoid repeating them.
+
+### P1: Token Deduplication in Gateway
+
+**Trap**: Creating one polling instance per \`channel_binding\` row. After migration, multiple coworkers share the same bot token (legacy single-bot setup). Two polling instances on the same Telegram token causes \`Conflict: terminated by other getUpdates request\`.
+
+**Rule**: \`TelegramGateway\` must deduplicate by token — one token = one polling connection. Messages are dispatched to ALL bindings associated with that token.
+
+### P2: \`channel_chat_id\` Is NOT a Unique Routing Key
+
+**Trap**: Using \`channel_chat_id\` (e.g., Telegram user ID) as dict key or queue key. In Telegram private chats, the same user talking to 3 different bots produces the same \`chat_id\`. Three coworkers' conversation dicts collide.
+
+**Rule**: Always use \`conversation_id\` (UUID) as the internal routing key. \`channel_chat_id\` is an external identifier used only for lookup in combination with \`channel_binding_id\`.
+
+### P3: Inbound Message Filtering in Multi-Bot Groups
+
+**Trap**: Storing all incoming messages without checking relevance. When 3 bots are in the same Telegram group, every bot receives ALL messages. \`@CS_Bot hello\` gets stored in Ops Bot's conversation, and if Ops Bot's trigger later matches something, it activates on irrelevant context.
+
+**Rule**: For group chats with \`requires_trigger=TRUE\`, check trigger BEFORE storing. If the message doesn't match this coworker's name, drop it entirely — do not store, do not enqueue.
+
+### P4: IPC Reply Routing Must Use Coworker Context
+
+**Trap**: \`send_message\` MCP tool sends a \`chatJid\`; Orchestrator scans all coworkers for a matching binding. In private chats, multiple coworkers share the same \`chatJid\`, and the reply goes through the wrong bot.
+
+**Rule**: IPC message handler must use the source coworker's own binding for reply routing. Never scan all bindings by \`chatJid\`.
+
+### P5: Dedup Between \`send_message\` and Results Stream
+
+**Trap**: Agent sends real-time progress via \`send_message\` MCP tool (Channel 4), and the same text appears again in \`ResultMessage\` (Channel 2). User receives duplicate messages.
+
+**Rule**: Track texts sent via \`send_message\` IPC; when processing \`ResultMessage\`, skip if the same text was already delivered via IPC.
+
+### P6: Event-Driven Inbound, Not Poll-Driven
+
+**Trap**: Relying on \`tenants.last_message_cursor\` polling to discover new messages. When multiple Slack apps receive the same group message at microsecond-level differences, one app's cursor advancement causes the other app's message to be permanently skipped.
+
+**Rule**: \`_handle_incoming\` must immediately \`enqueue_message_check(conversation_id)\` after storing. Do NOT rely on polling to discover new messages.
+
+### P7: Schema Migration Must Detect Legacy Tables
+
+**Trap**: \`init_database()\` runs on an existing Step 4 database. \`CREATE TABLE IF NOT EXISTS\` won't modify existing tables, but new indexes referencing new columns fail on old schemas.
+
+**Rule**: Detect legacy schema (e.g., check for \`chat_jid\` column in \`messages\`). If legacy, skip new-format creation until migration script runs. Migration: read old data → drop old tables → create new tables → write data.
+
+### P8: Migration Coworker Name Must Be ASSISTANT_NAME
+
+**Trap**: Using \`group.name\` (e.g., \`"all-rolemesh"\`) as \`coworker.name\`. Trigger pattern derived from \`coworker.name\` won't match the existing \`@Andy\` triggers in chat history.
+
+**Rule**: Migration must use the global \`ASSISTANT_NAME\` (e.g., \`"Andy"\`) as \`coworker.name\`, not the group display name.
+
+### P9: Migrate .claude Session Data Too
+
+**Trap**: Only migrating \`groups/{folder}/\` → \`workspace/\`. Forgetting \`data/sessions/{folder}/.claude/\` → session directory. Container reports \`.claude.json not found\` on startup.
+
+**Rule**: Migration must move BOTH workspace files AND \`.claude\` session data to the new directory structure.
+
+### P10: NATS Startup Cleanup
+
+**Trap**: After an unclean process exit, stale durable consumers block new subscriptions. Old messages in NATS stream get replayed on restart, flooding users with historical messages.
+
+**Rule**: On startup, \`delete_consumer\` for known durables + \`purge_stream\` to clear old messages.
+ISSUE_EOF
+)"
+```
+
+### 启动 Claude Code 执行
+
+Issue 创建后，记下 Issue 编号，新开 Claude Code 会话，粘贴以下内容：
+
+```
+请读取 GitHub Issue 并按要求完成任务：
+
+$(gh issue view 12 --json title,body --jq '"# " + .title + "\n\n" + .body')
+
+工作目录：py/
+分支：从 python-rewrite 创建新分支 step5/multi-tenant
+完成后提交代码并创建 PR。
+```
+
+> 替换为实际 Issue 编号。
+
+---
+
+## Step 5.1：合并 Role 到 Coworker（去除过度设计）
+
+**目标**：删除 `roles` 表，将其字段合并到 `coworkers` 表。Role 的"模板复用"能力当前没有代码使用，属于过度设计。
+
+**前置条件**：Step 5 完成。在 `step5/multi-tenant` 分支上直接做。
+
+**改动范围**：~200 行改动，涉及 6 个文件。
+
+### 创建 Issue 命令
+
+```bash
+gh issue create \
+  --title "refactor: merge roles table into coworkers (remove over-engineering)" \
+  --label "refactor,python-rewrite" \
+  --body "$(cat <<'ISSUE_EOF'
+## Context
+
+Step 5 introduced a \`roles\` table as an AI agent template layer: Role defines (system_prompt, tools, skills, agent_backend), Coworker inherits from Role and optionally overrides. This was designed for a scenario where 5 operations AI coworkers share the same prompt configuration.
+
+In practice, **no code uses the template-reuse capability**:
+- There is no UI to "create coworker from role"
+- \`CoworkerConfig\` merges Role + Coworker at load time, then Role is never accessed again
+- Migration creates a single \`"general"\` role that all coworkers point to — no differentiation
+- Every coworker creation requires a role to exist first, adding unnecessary ceremony
+
+The indirection adds complexity (extra table, extra JOIN, extra CRUD functions, \`role_id\` FK) with zero current benefit. If template reuse is needed later, adding the Role table back is a one-day task.
+
+**This refactoring runs on the \`step5/multi-tenant\` branch directly.**
+
+## Changes
+
+### 1. Database Schema
+
+**Drop \`roles\` table. Add its columns to \`coworkers\`:**
+
+\`\`\`sql
+-- After (one table, no roles):
+CREATE TABLE coworkers (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id),
+    name TEXT NOT NULL,                           -- coworker display name (trigger derived from this)
+    folder TEXT NOT NULL,
+    agent_backend TEXT DEFAULT 'claude-code',      -- moved from roles
+    system_prompt TEXT,                            -- moved from roles
+    tools JSONB DEFAULT '[]',                      -- moved from roles
+    skills JSONB DEFAULT '[]',                     -- moved from roles
+    is_admin BOOLEAN DEFAULT FALSE,
+    container_config JSONB,
+    max_concurrent INT DEFAULT 2,
+    status TEXT DEFAULT 'active',
+    created_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE (tenant_id, folder)
+);
+\`\`\`
+
+**Migration** (for existing Step 5 databases):
+\`\`\`sql
+-- Merge role fields into coworkers
+ALTER TABLE coworkers ADD COLUMN IF NOT EXISTS agent_backend TEXT DEFAULT 'claude-code';
+ALTER TABLE coworkers ADD COLUMN IF NOT EXISTS system_prompt TEXT;
+ALTER TABLE coworkers ADD COLUMN IF NOT EXISTS tools JSONB DEFAULT '[]';
+ALTER TABLE coworkers ADD COLUMN IF NOT EXISTS skills JSONB DEFAULT '[]';
+
+UPDATE coworkers SET
+    agent_backend = r.agent_backend,
+    system_prompt = r.system_prompt,
+    tools = r.tools,
+    skills = r.skills
+FROM roles r WHERE coworkers.role_id = r.id;
+
+ALTER TABLE coworkers DROP COLUMN IF EXISTS role_id;
+DROP TABLE IF EXISTS roles;
+\`\`\`
+
+### 2. \`src/nanoclaw/core/types.py\`
+
+**Delete** \`Role\` dataclass entirely.
+
+**Update** \`Coworker\` dataclass — add fields from Role, remove \`role_id\`:
+
+\`\`\`python
+@dataclass
+class Coworker:
+    id: str
+    tenant_id: str
+    name: str
+    folder: str
+    agent_backend: str = "claude-code"
+    system_prompt: str | None = None
+    tools: list[str] = field(default_factory=list)
+    skills: list[str] = field(default_factory=list)
+    is_admin: bool = False
+    container_config: ContainerConfig | None = None
+    max_concurrent: int = 2
+    status: str = "active"
+    created_at: str = ""
+\`\`\`
+
+**Update** \`registered_group_to_coworker()\` — remove \`role_id\` parameter.
+
+### 3. \`src/nanoclaw/core/orchestrator_state.py\`
+
+**Update** \`CoworkerConfig\` docstring from "merged from Role + Coworker" to "loaded from coworkers table".
+
+No field changes — CoworkerConfig already has all the right fields.
+
+### 4. \`src/nanoclaw/main.py\`
+
+**Remove**:
+- Imports: \`create_role\`, \`get_roles_for_tenant\`
+- Role loading loop in \`_load_multi_tenant_state()\`
+- \`roles_by_id\` dict
+- Role-Coworker merge logic when building \`CoworkerConfig\`
+- \`create_role()\` call in migration
+
+**Simplify** CoworkerConfig building — read directly from Coworker fields:
+\`\`\`python
+config = CoworkerConfig(
+    id=cw.id,
+    tenant_id=cw.tenant_id,
+    name=cw.name,
+    folder=cw.folder,
+    system_prompt=cw.system_prompt,
+    agent_backend=cw.agent_backend,
+    tools=cw.tools,
+    skills=cw.skills,
+    trigger_pattern=CoworkerConfig.build_trigger_pattern(cw.name),
+    container_image=None,
+    max_concurrent=cw.max_concurrent,
+    is_admin=cw.is_admin,
+)
+\`\`\`
+
+**Update** coworker creation — remove \`role_id\`, add config fields directly.
+
+### 5. \`src/nanoclaw/db/pg.py\`
+
+- **Delete** \`roles\` table DDL from \`_create_schema()\`
+- **Delete** \`create_role()\` and \`get_roles_for_tenant()\` functions
+- **Update** \`coworkers\` DDL — add \`agent_backend\`, \`system_prompt\`, \`tools\`, \`skills\`; remove \`role_id\` FK
+- **Update** \`create_coworker()\` signature — remove \`role_id\`, add new fields
+- **Update** \`_row_to_coworker()\` — read new columns, remove \`role_id\`
+- **Add** migration detection: if \`roles\` table exists, run ALTER + merge + DROP
+
+### 6. \`src/nanoclaw/db/__init__.py\`
+
+Remove re-exports: \`create_role\`, \`get_roles_for_tenant\`, \`Role\`.
+
+### 7. Tests
+
+Update tests that create roles before coworkers — pass config fields directly to \`create_coworker()\`.
+
+## Acceptance Criteria
+
+- [ ] \`roles\` table dropped from schema
+- [ ] \`Role\` dataclass deleted from \`core/types.py\`
+- [ ] \`create_role()\` and \`get_roles_for_tenant()\` deleted from \`db/pg.py\`
+- [ ] \`Coworker\` dataclass has \`agent_backend\`, \`system_prompt\`, \`tools\`, \`skills\` fields
+- [ ] \`Coworker\` dataclass has no \`role_id\` field
+- [ ] \`coworkers\` table has new columns, no \`role_id\`
+- [ ] \`main.py\` builds \`CoworkerConfig\` directly from \`Coworker\` (no role merging)
+- [ ] Migration handles both fresh install and existing Step 5 database
+- [ ] All tests pass
+- [ ] \`ruff check . && mypy --strict src/nanoclaw && pytest\` pass
+- [ ] No references to \`Role\`, \`role_id\`, \`create_role\`, or \`get_roles_for_tenant\` in production code
+
+## Important Notes
+
+- **Branch**: Work directly on \`step5/multi-tenant\` (not a new branch)
+- **This is a simplification** — behavior is identical, fewer tables and concepts
+- **If template reuse is needed later**, adding \`roles\` table back is straightforward
+- **Migration must handle two cases**: (a) fresh install — merged schema; (b) existing Step 5 DB — ALTER TABLE migration
+ISSUE_EOF
+)"
+```
+
+### 启动 Claude Code 执行
+
+Issue 创建后，记下 Issue 编号，新开 Claude Code 会话，粘贴以下内容：
+
+```
+请读取 GitHub Issue 并按要求完成任务：
+
+$(gh issue view 14 --json title,body --jq '"# " + .title + "\n\n" + .body')
+
+工作目录：py/
+分支：直接在 step5/multi-tenant 上工作（不创建新分支）
+完成后提交代码。
+```
+
+> 替换为实际 Issue 编号。
+
+---
+
+## Step 6：创建 RoleMesh 独立 Repo
+
+**目标**：将 `py/` 目录中的代码独立为新的 GitHub repo `RoleMesh`，所有 NanoClaw 引用替换为 RoleMesh，保持两个分支：`main`（来自 python-rewrite）和 `feat/multi-tenant`（来自 step5/multi-tenant）。
+
+**前置条件**：Step 5 和 Step 5.1 完成。
+
+**这是手动操作步骤，不需要 Claude Code 执行。**
+
+### 准备工作
+
+```bash
+# 确保两个分支都是最新的
+cd /home/jerry/ai/nanoclaw-worktree/nanoclaw
+git checkout python-rewrite && git pull
+git checkout step5/multi-tenant && git pull
+```
+
+### 第 1 步：创建 RoleMesh Repo
+
+```bash
+# 在 GitHub 上创建空 repo
+gh repo create Jerryguan777/rolemesh --private --description "AI Coworker Platform" --clone
+cd /home/jerry/ai/rolemesh
+```
+
+### 第 2 步：从 python-rewrite 构建 main 分支
+
+```bash
+# 回到 nanoclaw repo，切到 python-rewrite
+cd /home/jerry/ai/nanoclaw-worktree/nanoclaw
+git checkout python-rewrite
+
+# 复制 py/ 内容到 rolemesh repo 根目录
+cp -r py/* /home/jerry/ai/rolemesh/
+cp py/.gitignore /home/jerry/ai/rolemesh/ 2>/dev/null
+# 注意：不要复制 py/.venv/、py/__pycache__/ 等
+
+cd /home/jerry/ai/rolemesh
+```
+
+### 第 3 步：全局替换 NanoClaw → RoleMesh（main 分支）
+
+**3a. 文件内容替换**（三种大小写）：
+
+```bash
+# 查找所有需要替换的文本文件
+find . -type f \( \
+    -name '*.py' -o -name '*.md' -o -name '*.toml' -o -name '*.yml' -o \
+    -name '*.yaml' -o -name '*.sh' -o -name '*.json' -o -name '*.cfg' -o \
+    -name '*.txt' -o -name 'Dockerfile*' -o -name '*.lock' \
+\) -not -path './.venv/*' -not -path './__pycache__/*' -not -path './.git/*' \
+  -exec grep -l -i 'nanoclaw' {} \;
+
+# 执行替换（三种大小写）
+find . -type f \( \
+    -name '*.py' -o -name '*.md' -o -name '*.toml' -o -name '*.yml' -o \
+    -name '*.yaml' -o -name '*.sh' -o -name '*.json' -o -name '*.cfg' -o \
+    -name '*.txt' -o -name 'Dockerfile*' \
+\) -not -path './.venv/*' -not -path './__pycache__/*' -not -path './.git/*' \
+  -exec sed -i \
+    -e 's/NanoClaw/RoleMesh/g' \
+    -e 's/nanoclaw/rolemesh/g' \
+    -e 's/Nanoclaw/Rolemesh/g' \
+    -e 's/NANOCLAW/ROLEMESH/g' \
+    {} \;
+```
+
+**3b. 重命名 Python 包目录**：
+
+```bash
+mv src/nanoclaw src/rolemesh
+```
+
+**3c. 重命名其他路径中的引用**（如果有）：
+
+```bash
+# 检查是否有其他目录/文件名包含 nanoclaw
+find . -iname '*nanoclaw*' -not -path './.git/*' -not -path './.venv/*'
+# 逐个 mv 重命名
+```
+
+**3d. 更新 uv.lock**（重新生成）：
+
+```bash
+# uv.lock 中包含包名，直接重新生成更安全
+rm uv.lock
+uv lock
+```
+
+**3e. 验证替换完整**：
+
+```bash
+# 确认没有遗漏
+grep -r -i 'nanoclaw' --include='*.py' --include='*.md' --include='*.toml' \
+  --exclude-dir=.venv --exclude-dir=.git --exclude-dir=__pycache__ .
+
+# 应该返回空（没有结果）
+# 如果有遗漏，手动修复
+```
+
+**3f. 验证代码能运行**：
+
+```bash
+uv pip install -e ".[dev]"
+ruff check .
+ruff format --check .
+mypy --strict src/rolemesh
+pytest
+```
+
+### 第 4 步：提交并推送 main
+
+```bash
+git add -A
+git commit -s -m "initial: RoleMesh — AI Coworker Platform (from NanoClaw python-rewrite)"
+git push -u origin main
+```
+
+### 第 5 步：从 step5/multi-tenant 构建 feat/multi-tenant 分支
+
+```bash
+# 在 rolemesh repo 中创建新分支
+git checkout -b feat/multi-tenant
+
+# 清理当前内容（保留 .git）
+find . -maxdepth 1 -not -name '.git' -not -name '.' -exec rm -rf {} \;
+
+# 从 nanoclaw 的 step5/multi-tenant 复制
+cd /home/jerry/ai/nanoclaw-worktree/nanoclaw
+git checkout step5/multi-tenant
+
+cp -r py/* /home/jerry/ai/rolemesh/
+cp py/.gitignore /home/jerry/ai/rolemesh/ 2>/dev/null
+
+cd /home/jerry/ai/rolemesh
+```
+
+### 第 6 步：全局替换 NanoClaw → RoleMesh（feat/multi-tenant 分支）
+
+```bash
+# 和第 3 步完全相同的替换操作
+find . -type f \( \
+    -name '*.py' -o -name '*.md' -o -name '*.toml' -o -name '*.yml' -o \
+    -name '*.yaml' -o -name '*.sh' -o -name '*.json' -o -name '*.cfg' -o \
+    -name '*.txt' -o -name 'Dockerfile*' \
+\) -not -path './.venv/*' -not -path './__pycache__/*' -not -path './.git/*' \
+  -exec sed -i \
+    -e 's/NanoClaw/RoleMesh/g' \
+    -e 's/nanoclaw/rolemesh/g' \
+    -e 's/Nanoclaw/Rolemesh/g' \
+    -e 's/NANOCLAW/ROLEMESH/g' \
+    {} \;
+
+# 重命名包目录
+mv src/nanoclaw src/rolemesh
+
+# 检查其他路径
+find . -iname '*nanoclaw*' -not -path './.git/*' -not -path './.venv/*'
+
+# 重新生成 lock
+rm uv.lock
+uv lock
+
+# 验证没有遗漏
+grep -r -i 'nanoclaw' --include='*.py' --include='*.md' --include='*.toml' \
+  --exclude-dir=.venv --exclude-dir=.git --exclude-dir=__pycache__ .
+
+# 验证代码
+uv pip install -e ".[dev]"
+ruff check .
+mypy --strict src/rolemesh
+pytest
+```
+
+### 第 7 步：提交并推送 feat/multi-tenant
+
+```bash
+git add -A
+git commit -s -m "feat: multi-tenant multi-coworker architecture"
+git push -u origin feat/multi-tenant
+```
+
+### 第 8 步：验证 diff 正确
+
+```bash
+# 查看 main → feat/multi-tenant 的差异，确认是 step5 的改动
+git diff main..feat/multi-tenant --stat
+
+# 应该看到和 nanoclaw 中 python-rewrite → step5/multi-tenant 相同的文件变化
+# （只是路径从 nanoclaw → rolemesh）
+```
+
+### 替换清单（需要人工检查的特殊位置）
+
+以下位置可能需要手动确认替换是否正确（sed 全局替换可能不够精确）：
+
+| 位置 | 检查项 |
+|------|--------|
+| `pyproject.toml` | `name = "rolemesh"`、`rolemesh = "rolemesh.main:main_sync"` |
+| `src/rolemesh/__init__.py` | 包名正确 |
+| `src/agent_runner/` | import 路径改为 `from rolemesh.xxx` |
+| `container/Dockerfile` | 如果引用了包名 |
+| `docker-compose.dev.yml` | 服务名（如果有） |
+| `CLAUDE.md` | 项目名描述 |
+| `docs/*.md` | 所有文档中的项目名 |
+| `tests/` | import 路径 |
+| `container/runner.py` | 容器名前缀 `nanoclaw-` → `rolemesh-` |
+| `container/scheduler.py` | orphan cleanup 前缀 |
+| `STEPS.md` | 整个文件（但此文件可能不需要复制到新 repo——它是 nanoclaw 的演进记录） |
+
+### 不应复制到新 Repo 的文件
+
+| 文件 | 原因 |
+|------|------|
+| `STEPS.md` | NanoClaw 的演进步骤记录，属于 nanoclaw repo |
+| `py/.venv/` | 虚拟环境，不提交 |
+| `py/__pycache__/` | 缓存 |
+| `py/store/` | 运行时数据 |
+| `py/data/` | 运行时数据 |
+| `py/groups/` | 旧的运行时数据 |
+| `py/.mypy_cache/` | 缓存 |
+
+### 最终 Repo 结构
+
+```
+rolemesh/                        ← repo root（原 py/）
+├── pyproject.toml               # name = "rolemesh"
+├── uv.lock
+├── ruff.toml
+├── CLAUDE.md                    # 项目说明改为 RoleMesh
+├── README.md                    # 新写（或从 nanoclaw 改编）
+├── docker-compose.dev.yml
+├── src/
+│   ├── rolemesh/                # 原 nanoclaw/
+│   │   ├── core/
+│   │   ├── db/
+│   │   ├── channels/
+│   │   ├── security/
+│   │   ├── container/
+│   │   ├── ipc/
+│   │   ├── agent/
+│   │   ├── orchestration/
+│   │   └── main.py
+│   └── agent_runner/            # 不改名（和 rolemesh 无关）
+├── container/
+│   ├── Dockerfile
+│   └── build.sh
+├── scripts/
+├── tests/
+└── docs/
+    ├── multi-tenant-architecture.md
+    ├── nats-ipc-architecture.md
+    ├── agent-executor-and-container-runtime.md
+    └── ppi-integration-guide.md
+```
