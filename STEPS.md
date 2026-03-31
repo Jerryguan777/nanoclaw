@@ -9,10 +9,11 @@
 ## 执行顺序
 
 ```
-Step 1（文件重组）──→ Step 2（NATS IPC）──→ Step 3（AgentExecutor + Docker API）──→ Step 4（SQLite → PG）──→ Step 5（多租户）
+Step 1 → Step 2 → Step 3 → Step 4 → Step 5 → Step 5.1 → Step 6
+(重组)   (NATS)  (Executor) (PG)    (多租户)  (合并Role) (RoleMesh独立Repo)
 ```
 
-严格顺序执行。Step 1、2、3 已完成。Step 4 将 SQLite 替换为 PostgreSQL。Step 5 在 PG 基础上实现多租户、多 Coworker 架构。
+Step 1-5.1 已完成。Step 6 将 `py/` 独立为新 GitHub repo **RoleMesh**。
 
 ---
 
@@ -2650,3 +2651,261 @@ $(gh issue view 14 --json title,body --jq '"# " + .title + "\n\n" + .body')
 ```
 
 > 替换为实际 Issue 编号。
+
+---
+
+## Step 6：创建 RoleMesh 独立 Repo
+
+**目标**：将 `py/` 目录中的代码独立为新的 GitHub repo `RoleMesh`，所有 NanoClaw 引用替换为 RoleMesh，保持两个分支：`main`（来自 python-rewrite）和 `feat/multi-tenant`（来自 step5/multi-tenant）。
+
+**前置条件**：Step 5 和 Step 5.1 完成。
+
+**这是手动操作步骤，不需要 Claude Code 执行。**
+
+### 准备工作
+
+```bash
+# 确保两个分支都是最新的
+cd /home/jerry/ai/nanoclaw-worktree/nanoclaw
+git checkout python-rewrite && git pull
+git checkout step5/multi-tenant && git pull
+```
+
+### 第 1 步：创建 RoleMesh Repo
+
+```bash
+# 在 GitHub 上创建空 repo
+gh repo create Jerryguan777/rolemesh --private --description "AI Coworker Platform" --clone
+cd /home/jerry/ai/rolemesh
+```
+
+### 第 2 步：从 python-rewrite 构建 main 分支
+
+```bash
+# 回到 nanoclaw repo，切到 python-rewrite
+cd /home/jerry/ai/nanoclaw-worktree/nanoclaw
+git checkout python-rewrite
+
+# 复制 py/ 内容到 rolemesh repo 根目录
+cp -r py/* /home/jerry/ai/rolemesh/
+cp py/.gitignore /home/jerry/ai/rolemesh/ 2>/dev/null
+# 注意：不要复制 py/.venv/、py/__pycache__/ 等
+
+cd /home/jerry/ai/rolemesh
+```
+
+### 第 3 步：全局替换 NanoClaw → RoleMesh（main 分支）
+
+**3a. 文件内容替换**（三种大小写）：
+
+```bash
+# 查找所有需要替换的文本文件
+find . -type f \( \
+    -name '*.py' -o -name '*.md' -o -name '*.toml' -o -name '*.yml' -o \
+    -name '*.yaml' -o -name '*.sh' -o -name '*.json' -o -name '*.cfg' -o \
+    -name '*.txt' -o -name 'Dockerfile*' -o -name '*.lock' \
+\) -not -path './.venv/*' -not -path './__pycache__/*' -not -path './.git/*' \
+  -exec grep -l -i 'nanoclaw' {} \;
+
+# 执行替换（三种大小写）
+find . -type f \( \
+    -name '*.py' -o -name '*.md' -o -name '*.toml' -o -name '*.yml' -o \
+    -name '*.yaml' -o -name '*.sh' -o -name '*.json' -o -name '*.cfg' -o \
+    -name '*.txt' -o -name 'Dockerfile*' \
+\) -not -path './.venv/*' -not -path './__pycache__/*' -not -path './.git/*' \
+  -exec sed -i \
+    -e 's/NanoClaw/RoleMesh/g' \
+    -e 's/nanoclaw/rolemesh/g' \
+    -e 's/Nanoclaw/Rolemesh/g' \
+    -e 's/NANOCLAW/ROLEMESH/g' \
+    {} \;
+```
+
+**3b. 重命名 Python 包目录**：
+
+```bash
+mv src/nanoclaw src/rolemesh
+```
+
+**3c. 重命名其他路径中的引用**（如果有）：
+
+```bash
+# 检查是否有其他目录/文件名包含 nanoclaw
+find . -iname '*nanoclaw*' -not -path './.git/*' -not -path './.venv/*'
+# 逐个 mv 重命名
+```
+
+**3d. 更新 uv.lock**（重新生成）：
+
+```bash
+# uv.lock 中包含包名，直接重新生成更安全
+rm uv.lock
+uv lock
+```
+
+**3e. 验证替换完整**：
+
+```bash
+# 确认没有遗漏
+grep -r -i 'nanoclaw' --include='*.py' --include='*.md' --include='*.toml' \
+  --exclude-dir=.venv --exclude-dir=.git --exclude-dir=__pycache__ .
+
+# 应该返回空（没有结果）
+# 如果有遗漏，手动修复
+```
+
+**3f. 验证代码能运行**：
+
+```bash
+uv pip install -e ".[dev]"
+ruff check .
+ruff format --check .
+mypy --strict src/rolemesh
+pytest
+```
+
+### 第 4 步：提交并推送 main
+
+```bash
+git add -A
+git commit -s -m "initial: RoleMesh — AI Coworker Platform (from NanoClaw python-rewrite)"
+git push -u origin main
+```
+
+### 第 5 步：从 step5/multi-tenant 构建 feat/multi-tenant 分支
+
+```bash
+# 在 rolemesh repo 中创建新分支
+git checkout -b feat/multi-tenant
+
+# 清理当前内容（保留 .git）
+find . -maxdepth 1 -not -name '.git' -not -name '.' -exec rm -rf {} \;
+
+# 从 nanoclaw 的 step5/multi-tenant 复制
+cd /home/jerry/ai/nanoclaw-worktree/nanoclaw
+git checkout step5/multi-tenant
+
+cp -r py/* /home/jerry/ai/rolemesh/
+cp py/.gitignore /home/jerry/ai/rolemesh/ 2>/dev/null
+
+cd /home/jerry/ai/rolemesh
+```
+
+### 第 6 步：全局替换 NanoClaw → RoleMesh（feat/multi-tenant 分支）
+
+```bash
+# 和第 3 步完全相同的替换操作
+find . -type f \( \
+    -name '*.py' -o -name '*.md' -o -name '*.toml' -o -name '*.yml' -o \
+    -name '*.yaml' -o -name '*.sh' -o -name '*.json' -o -name '*.cfg' -o \
+    -name '*.txt' -o -name 'Dockerfile*' \
+\) -not -path './.venv/*' -not -path './__pycache__/*' -not -path './.git/*' \
+  -exec sed -i \
+    -e 's/NanoClaw/RoleMesh/g' \
+    -e 's/nanoclaw/rolemesh/g' \
+    -e 's/Nanoclaw/Rolemesh/g' \
+    -e 's/NANOCLAW/ROLEMESH/g' \
+    {} \;
+
+# 重命名包目录
+mv src/nanoclaw src/rolemesh
+
+# 检查其他路径
+find . -iname '*nanoclaw*' -not -path './.git/*' -not -path './.venv/*'
+
+# 重新生成 lock
+rm uv.lock
+uv lock
+
+# 验证没有遗漏
+grep -r -i 'nanoclaw' --include='*.py' --include='*.md' --include='*.toml' \
+  --exclude-dir=.venv --exclude-dir=.git --exclude-dir=__pycache__ .
+
+# 验证代码
+uv pip install -e ".[dev]"
+ruff check .
+mypy --strict src/rolemesh
+pytest
+```
+
+### 第 7 步：提交并推送 feat/multi-tenant
+
+```bash
+git add -A
+git commit -s -m "feat: multi-tenant multi-coworker architecture"
+git push -u origin feat/multi-tenant
+```
+
+### 第 8 步：验证 diff 正确
+
+```bash
+# 查看 main → feat/multi-tenant 的差异，确认是 step5 的改动
+git diff main..feat/multi-tenant --stat
+
+# 应该看到和 nanoclaw 中 python-rewrite → step5/multi-tenant 相同的文件变化
+# （只是路径从 nanoclaw → rolemesh）
+```
+
+### 替换清单（需要人工检查的特殊位置）
+
+以下位置可能需要手动确认替换是否正确（sed 全局替换可能不够精确）：
+
+| 位置 | 检查项 |
+|------|--------|
+| `pyproject.toml` | `name = "rolemesh"`、`rolemesh = "rolemesh.main:main_sync"` |
+| `src/rolemesh/__init__.py` | 包名正确 |
+| `src/agent_runner/` | import 路径改为 `from rolemesh.xxx` |
+| `container/Dockerfile` | 如果引用了包名 |
+| `docker-compose.dev.yml` | 服务名（如果有） |
+| `CLAUDE.md` | 项目名描述 |
+| `docs/*.md` | 所有文档中的项目名 |
+| `tests/` | import 路径 |
+| `container/runner.py` | 容器名前缀 `nanoclaw-` → `rolemesh-` |
+| `container/scheduler.py` | orphan cleanup 前缀 |
+| `STEPS.md` | 整个文件（但此文件可能不需要复制到新 repo——它是 nanoclaw 的演进记录） |
+
+### 不应复制到新 Repo 的文件
+
+| 文件 | 原因 |
+|------|------|
+| `STEPS.md` | NanoClaw 的演进步骤记录，属于 nanoclaw repo |
+| `py/.venv/` | 虚拟环境，不提交 |
+| `py/__pycache__/` | 缓存 |
+| `py/store/` | 运行时数据 |
+| `py/data/` | 运行时数据 |
+| `py/groups/` | 旧的运行时数据 |
+| `py/.mypy_cache/` | 缓存 |
+
+### 最终 Repo 结构
+
+```
+rolemesh/                        ← repo root（原 py/）
+├── pyproject.toml               # name = "rolemesh"
+├── uv.lock
+├── ruff.toml
+├── CLAUDE.md                    # 项目说明改为 RoleMesh
+├── README.md                    # 新写（或从 nanoclaw 改编）
+├── docker-compose.dev.yml
+├── src/
+│   ├── rolemesh/                # 原 nanoclaw/
+│   │   ├── core/
+│   │   ├── db/
+│   │   ├── channels/
+│   │   ├── security/
+│   │   ├── container/
+│   │   ├── ipc/
+│   │   ├── agent/
+│   │   ├── orchestration/
+│   │   └── main.py
+│   └── agent_runner/            # 不改名（和 rolemesh 无关）
+├── container/
+│   ├── Dockerfile
+│   └── build.sh
+├── scripts/
+├── tests/
+└── docs/
+    ├── multi-tenant-architecture.md
+    ├── nats-ipc-architecture.md
+    ├── agent-executor-and-container-runtime.md
+    └── ppi-integration-guide.md
+```
